@@ -240,6 +240,10 @@ impl EntityRepository for DefraDbEntityRepository {
             .collect::<Result<Vec<_>, _>>()?;
         filter_entity_documents(documents, plan)
     }
+
+    async fn list_tenants(&self) -> Result<Vec<String>, BrokerError> {
+        list_distinct_tenants(&self.client, ENTITY_COLLECTION).await
+    }
 }
 
 #[derive(Clone)]
@@ -432,6 +436,10 @@ impl SubscriptionRepository for DefraDbSubscriptionRepository {
         Ok(documents)
     }
 
+    async fn list_tenants(&self) -> Result<Vec<String>, BrokerError> {
+        list_distinct_tenants(&self.client, SUBSCRIPTION_COLLECTION).await
+    }
+
     async fn mark_delivery(
         &self,
         tenant: &str,
@@ -510,6 +518,22 @@ async fn list_opaque_records(
     Ok(data.records)
 }
 
+async fn list_distinct_tenants(
+    client: &DefraDbClient,
+    collection: &str,
+) -> Result<Vec<String>, BrokerError> {
+    let query = format!("query {{ {collection} {{ tenant }} }}");
+    let data: TenantListData = client.execute(&query, json!({})).await?;
+    let mut tenants = data
+        .records
+        .into_iter()
+        .map(|record| record.tenant)
+        .collect::<Vec<_>>();
+    tenants.sort();
+    tenants.dedup();
+    Ok(tenants)
+}
+
 async fn create_opaque_record(
     client: &DefraDbClient,
     collection: &str,
@@ -518,7 +542,7 @@ async fn create_opaque_record(
     payload: &str,
 ) -> Result<(), BrokerError> {
     let query = format!(
-        "mutation($tenant: String!, $ngsiId: String!, $payload: String!) {{ create_{collection}(input: {{tenant: $tenant, ngsiId: $ngsiId, payload: $payload}}) {{ _docID }} }}"
+        "mutation($tenant: String!, $ngsiId: String!, $payload: String!) {{ add_{collection}(input: [{{tenant: $tenant, ngsiId: $ngsiId, payload: $payload}}]) {{ _docID }} }}"
     );
     let _: Value = client
         .execute(
@@ -538,12 +562,12 @@ async fn update_opaque_record(
     payload: &str,
 ) -> Result<(), BrokerError> {
     let query = format!(
-        "mutation($docID: ID!, $tenant: String!, $ngsiId: String!, $payload: String!) {{ update_{collection}(docID: $docID, input: {{tenant: $tenant, ngsiId: $ngsiId, payload: $payload}}) {{ _docID }} }}"
+        "mutation($docID: [ID!], $tenant: String!, $ngsiId: String!, $payload: String!) {{ update_{collection}(docID: $docID, input: {{tenant: $tenant, ngsiId: $ngsiId, payload: $payload}}) {{ _docID }} }}"
     );
     let _: Value = client
         .execute(
             &query,
-            json!({"docID": doc_id, "tenant": tenant, "ngsiId": ngsi_id, "payload": payload}),
+            json!({"docID": [doc_id], "tenant": tenant, "ngsiId": ngsi_id, "payload": payload}),
         )
         .await?;
     Ok(())
@@ -555,8 +579,8 @@ async fn delete_opaque_record(
     doc_id: &str,
 ) -> Result<(), BrokerError> {
     let query =
-        format!("mutation($docID: ID!) {{ delete_{collection}(docID: $docID) {{ _docID }} }}");
-    let _: Value = client.execute(&query, json!({"docID": doc_id})).await?;
+        format!("mutation($docID: [ID!]) {{ delete_{collection}(docID: $docID) {{ _docID }} }}");
+    let _: Value = client.execute(&query, json!({"docID": [doc_id]})).await?;
     Ok(())
 }
 
@@ -601,7 +625,7 @@ async fn create_temporal_record(
     let _: Value = client
         .execute(
             &format!(
-                "mutation($tenant: String!, $ngsiId: String!, $payload: String!, $historyJson: String!) {{ create_{TEMPORAL_COLLECTION}(input: {{tenant: $tenant, ngsiId: $ngsiId, payload: $payload, historyJson: $historyJson}}) {{ _docID }} }}"
+                "mutation($tenant: String!, $ngsiId: String!, $payload: String!, $historyJson: String!) {{ add_{TEMPORAL_COLLECTION}(input: [{{tenant: $tenant, ngsiId: $ngsiId, payload: $payload, historyJson: $historyJson}}]) {{ _docID }} }}"
             ),
             json!({
                 "tenant": tenant,
@@ -625,10 +649,10 @@ async fn update_temporal_record(
     let _: Value = client
         .execute(
             &format!(
-                "mutation($docID: ID!, $tenant: String!, $ngsiId: String!, $payload: String!, $historyJson: String!) {{ update_{TEMPORAL_COLLECTION}(docID: $docID, input: {{tenant: $tenant, ngsiId: $ngsiId, payload: $payload, historyJson: $historyJson}}) {{ _docID }} }}"
+                "mutation($docID: [ID!], $tenant: String!, $ngsiId: String!, $payload: String!, $historyJson: String!) {{ update_{TEMPORAL_COLLECTION}(docID: $docID, input: {{tenant: $tenant, ngsiId: $ngsiId, payload: $payload, historyJson: $historyJson}}) {{ _docID }} }}"
             ),
             json!({
-                "docID": doc_id,
+                "docID": [doc_id],
                 "tenant": tenant,
                 "ngsiId": ngsi_id,
                 "payload": payload,
@@ -643,9 +667,9 @@ async fn delete_temporal_record(client: &DefraDbClient, doc_id: &str) -> Result<
     let _: Value = client
         .execute(
             &format!(
-                "mutation($docID: ID!) {{ delete_{TEMPORAL_COLLECTION}(docID: $docID) {{ _docID }} }}"
+                "mutation($docID: [ID!]) {{ delete_{TEMPORAL_COLLECTION}(docID: $docID) {{ _docID }} }}"
             ),
-            json!({"docID": doc_id}),
+            json!({"docID": [doc_id]}),
         )
         .await?;
     Ok(())
@@ -655,6 +679,17 @@ async fn delete_temporal_record(client: &DefraDbClient, doc_id: &str) -> Result<
 struct OpaqueRecordListData {
     #[serde(rename = "EntityRecord", alias = "SubscriptionRecord")]
     records: Vec<OpaqueRecordRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TenantRow {
+    tenant: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TenantListData {
+    #[serde(rename = "EntityRecord", alias = "SubscriptionRecord")]
+    records: Vec<TenantRow>,
 }
 
 #[derive(Debug, Deserialize)]

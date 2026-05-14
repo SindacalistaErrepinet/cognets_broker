@@ -1,0 +1,238 @@
+version: "3.8"
+
+x-defradb-service: &defradb-service
+  image: sourcenetwork/defradb:1.0.0-rc1
+  environment:
+    DEFRA_KEYRING_SECRET: test-secret
+  command:
+    - start
+    - --rootdir
+    - /data
+    - --url
+    - 0.0.0.0:9181
+    - --p2paddr
+    - /ip4/0.0.0.0/tcp/9171
+    - --development
+  networks:
+    - swarm
+
+x-broker-service: &broker-service
+  image: debian:bookworm-slim
+  command: ["/usr/local/bin/cognets_broker"]
+  environment: &broker-env
+    RUST_LOG: info
+    BROKER_HOST: 0.0.0.0
+    BROKER_PORT: 8080
+    BROKER_OUTBOUND_TIMEOUT_MS: 5000
+    BROKER_ENTITY_WATCH_ENABLED: "true"
+    BROKER_ENTITY_WATCH_INTERVAL_MS: 250
+  volumes:
+    - ./target/debug/cognets_broker:/usr/local/bin/cognets_broker:ro
+  networks:
+    - swarm
+
+services:
+  sink:
+    image: python:3.12-alpine
+    command: ["python", "/app/notification_sink.py", "8080"]
+    volumes:
+      - ./tests/notification_sink.py:/app/notification_sink.py:ro
+    ports:
+      - "19080:8080"
+    networks:
+      - swarm
+
+  defra1:
+    <<: *defradb-service
+    volumes:
+      - defra1-data:/data
+
+  defra2:
+    <<: *defradb-service
+    volumes:
+      - defra2-data:/data
+
+  defra3:
+    <<: *defradb-service
+    volumes:
+      - defra3-data:/data
+
+  defra4:
+    <<: *defradb-service
+    volumes:
+      - defra4-data:/data
+
+  defra5:
+    <<: *defradb-service
+    volumes:
+      - defra5-data:/data
+
+  defra6:
+    <<: *defradb-service
+    volumes:
+      - defra6-data:/data
+
+  defra7:
+    <<: *defradb-service
+    volumes:
+      - defra7-data:/data
+
+  defra8:
+    <<: *defradb-service
+    volumes:
+      - defra8-data:/data
+
+  defra9:
+    <<: *defradb-service
+    volumes:
+      - defra9-data:/data
+
+  defra10:
+    <<: *defradb-service
+    volumes:
+      - defra10-data:/data
+
+  broker1:
+    <<: *broker-service
+    depends_on:
+      - sink
+      - defra1
+    environment:
+      <<: *broker-env
+      BROKER_ID: broker1
+      BROKER_PUBLIC_ENDPOINT: http://broker1:8080/ngsi-ld/v1
+      BROKER_DEFRADB_URL: http://defra1:9181/api/v0/graphql
+    ports:
+      - "18081:8080"
+
+  broker2:
+    <<: *broker-service
+    depends_on:
+      - sink
+      - defra2
+    environment:
+      <<: *broker-env
+      BROKER_ID: broker2
+      BROKER_PUBLIC_ENDPOINT: http://broker2:8080/ngsi-ld/v1
+      BROKER_DEFRADB_URL: http://defra2:9181/api/v0/graphql
+    ports:
+      - "18082:8080"
+
+  broker3:
+    <<: *broker-service
+    depends_on:
+      - sink
+      - defra3
+    environment:
+      <<: *broker-env
+      BROKER_ID: broker3
+      BROKER_PUBLIC_ENDPOINT: http://broker3:8080/ngsi-ld/v1
+      BROKER_DEFRADB_URL: http://defra3:9181/api/v0/graphql
+    ports:
+      - "18083:8080"
+
+  broker4:
+    <<: *broker-service
+    depends_on:
+      - sink
+      - defra4
+    environment:
+      <<: *broker-env
+      BROKER_ID: broker4
+      BROKER_PUBLIC_ENDPOINT: http://broker4:8080/ngsi-ld/v1
+      BROKER_DEFRADB_URL: http://defra4:9181/api/v0/graphql
+    ports:
+      - "18084:8080"
+
+  broker5:
+    <<: *broker-service
+    depends_on:
+      - sink
+      - defra5
+    environment:
+      <<: *broker-env
+      BROKER_ID: broker5
+      BROKER_PUBLIC_ENDPOINT: http://broker5:8080/ngsi-ld/v1
+      BROKER_DEFRADB_URL: http://defra5:9181/api/v0/graphql
+    ports:
+      - "18085:8080"
+
+  broker6:
+    <<: *broker-service
+    depends_on:
+      - sink
+      - defra6
+    environment:
+      <<: *broker-env
+      BROKER_ID: broker6
+      BROKER_PUBLIC_ENDPOINT: http://broker6:8080/ngsi-ld/v1
+      BROKER_DEFRADB_URL: http://defra6:9181/api/v0/graphql
+    ports:
+      - "18086:8080"
+
+  broker7:
+    <<: *broker-service
+    depends_on:
+      - sink
+      - defra7
+    environment:
+      <<: *broker-env
+      BROKER_ID: broker7
+      BROKER_PUBLIC_ENDPOINT: http://broker7:8080/ngsi-ld/v1
+      BROKER_DEFRADB_URL: http://defra7:9181/api/v0/graphql
+    ports:
+      - "18087:8080"
+
+  broker8:
+    <<: *broker-service
+    depends_on:
+      - sink
+      - defra8
+    environment:
+      <<: *broker-env
+      BROKER_ID: broker8
+      BROKER_PUBLIC_ENDPOINT: http://broker8:8080/ngsi-ld/v1
+      BROKER_DEFRADB_URL: http://defra8:9181/api/v0/graphql
+    ports:
+      - "18088:8080"
+
+  broker9:
+    <<: *broker-service
+    depends_on:
+      - sink
+      - defra9
+    environment:
+      <<: *broker-env
+      BROKER_ID: broker9
+      BROKER_PUBLIC_ENDPOINT: http://broker9:8080/ngsi-ld/v1
+      BROKER_DEFRADB_URL: http://defra9:9181/api/v0/graphql
+    ports:
+      - "18089:8080"
+
+  broker10:
+    <<: *broker-service
+    depends_on:
+      - sink
+      - defra10
+    environment:
+      <<: *broker-env
+      BROKER_ID: broker10
+      BROKER_PUBLIC_ENDPOINT: http://broker10:8080/ngsi-ld/v1
+      BROKER_DEFRADB_URL: http://defra10:9181/api/v0/graphql
+    ports:
+      - "18090:8080"
+
+networks:
+  swarm:
+
+volumes:
+  defra1-data:
+  defra2-data:
+  defra3-data:
+  defra4-data:
+  defra5-data:
+  defra6-data:
+  defra7-data:
+  defra8-data:
+  defra9-data:
+  defra10-data:

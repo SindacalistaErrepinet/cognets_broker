@@ -2,7 +2,10 @@ use std::time::{Duration, Instant};
 
 use reqwest::Client;
 
-use crate::{config::AppConfig, error::BrokerError, persistence::repository::Repositories};
+use crate::{
+    app::entity_watch::EntityWatchState, config::AppConfig, error::BrokerError,
+    persistence::repository::Repositories,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -10,6 +13,7 @@ pub struct AppState {
     pub repositories: Repositories,
     pub http_client: Client,
     pub started_at: Instant,
+    pub entity_watch: EntityWatchState,
 }
 
 impl AppState {
@@ -27,6 +31,7 @@ impl AppState {
             repositories,
             http_client,
             started_at: Instant::now(),
+            entity_watch: EntityWatchState::default(),
         })
     }
 }

@@ -56,6 +56,8 @@ pub trait EntityRepository: Send + Sync {
         tenant: &str,
         plan: &MongoQueryPlan,
     ) -> Result<Vec<StoredDocument>, BrokerError>;
+    /// Lists tenants currently present in entity storage.
+    async fn list_tenants(&self) -> Result<Vec<String>, BrokerError>;
 }
 
 #[async_trait]
@@ -104,6 +106,8 @@ pub trait SubscriptionRepository: Send + Sync {
         tenant: &str,
         limit: Option<usize>,
     ) -> Result<Vec<SubscriptionDocument>, BrokerError>;
+    /// Lists tenants currently present in subscription storage.
+    async fn list_tenants(&self) -> Result<Vec<String>, BrokerError>;
     /// Updates delivery accounting fields after notification attempt.
     async fn mark_delivery(
         &self,

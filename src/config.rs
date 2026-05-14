@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub public_endpoint: String,
     pub defradb_url: String,
     pub outbound_timeout_ms: u64,
+    pub entity_watch_enabled: bool,
+    pub entity_watch_interval_ms: u64,
 }
 
 impl AppConfig {
@@ -30,6 +32,10 @@ impl AppConfig {
             outbound_timeout_ms: env_or("BROKER_OUTBOUND_TIMEOUT_MS", "5000")
                 .parse()
                 .unwrap_or(5000),
+            entity_watch_enabled: env_bool_or("BROKER_ENTITY_WATCH_ENABLED", true),
+            entity_watch_interval_ms: env_or("BROKER_ENTITY_WATCH_INTERVAL_MS", "1000")
+                .parse()
+                .unwrap_or(1000),
         }
     }
 
@@ -43,6 +49,8 @@ impl AppConfig {
             public_endpoint: "http://127.0.0.1:8080/ngsi-ld/v1".to_string(),
             defradb_url: "http://127.0.0.1:9181/api/v0/graphql".to_string(),
             outbound_timeout_ms: 2000,
+            entity_watch_enabled: true,
+            entity_watch_interval_ms: 1000,
         }
     }
 }
@@ -50,4 +58,16 @@ impl AppConfig {
 /// Reads environment variable or falls back to default value.
 fn env_or(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+/// Reads boolean environment variable or falls back to default value.
+fn env_bool_or(name: &str, default: bool) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
 }

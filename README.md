@@ -134,6 +134,8 @@ Environment variables:
 - `BROKER_PUBLIC_ENDPOINT`: public broker base URL, default `http://127.0.0.1:8080/ngsi-ld/v1`
 - `BROKER_DEFRADB_URL`: DefraDB GraphQL endpoint, default `http://127.0.0.1:9181/api/v0/graphql`
 - `BROKER_OUTBOUND_TIMEOUT_MS`: outbound HTTP timeout in milliseconds, default `5000`
+- `BROKER_ENTITY_WATCH_ENABLED`: enables replicated-entity polling watcher for cross-node notifications, default `true`
+- `BROKER_ENTITY_WATCH_INTERVAL_MS`: watcher poll interval in milliseconds, default `1000`
 
 ## Run
 
@@ -164,6 +166,18 @@ Run:
 cargo test
 ```
 
+Ignored live swarm coverage:
+
+```bash
+bash tests/swarm_integration.sh
+```
+
+Or through Cargo:
+
+```bash
+cargo test --test swarm_integration -- --ignored
+```
+
 Current automated coverage includes:
 
 - query planner parsing
@@ -171,8 +185,24 @@ Current automated coverage includes:
 - temporal filtering and aggregation helpers
 - notification matching and delivery behavior
 - handler-level validation responses for bad requests
+- live 10-node DefraDB P2P entity replication plus cross-node notification delivery with subscriptions remaining local via `tests/swarm_integration.sh`
 
-Current suite does not include live end-to-end tests against running DefraDB.
+Swarm test details:
+
+- uses `docker-compose.yml` to start 10 DefraDB nodes, 10 broker nodes, and one HTTP notification sink
+- keeps subscriptions local to each broker and proves they are not visible from other brokers
+- DefraDB P2P is enabled only for `EntityRecord`; `SubscriptionRecord` is never added to pubsub or replicators
+- verifies create from `broker1`, update from `broker5`, and delete from `broker9`
+- asserts every broker observes replicated entity state and emits one local notification for each lifecycle step
+- uses existing host `target/debug/cognets_broker` binary and builds it automatically if missing
+- set `KEEP_SWARM=1` to inspect running containers after the script exits
+
+Subscription storage policy:
+
+- current setup stores subscriptions in each broker's local DefraDB instance only
+- this is safe as long as `SubscriptionRecord` stays out of DefraDB P2P replication
+- if you want stronger isolation than configuration-only enforcement, use a separate local-only store for subscriptions
+- recommended separate store: SQLite per broker, because subscription CRUD and delivery counters are small, local, transactional, and do not need distributed replication
 
 ## Current Gaps
 

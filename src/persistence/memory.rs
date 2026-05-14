@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -94,6 +94,18 @@ impl EntityRepository for MemoryEntityRepository {
             .cloned()
             .collect::<Vec<_>>();
         filter_entity_documents(documents, plan)
+    }
+
+    async fn list_tenants(&self) -> Result<Vec<String>, BrokerError> {
+        Ok(self
+            .documents
+            .lock()
+            .unwrap()
+            .values()
+            .map(|document| document.tenant.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
     }
 }
 
@@ -223,6 +235,18 @@ impl SubscriptionRepository for MemorySubscriptionRepository {
             documents.truncate(limit);
         }
         Ok(documents)
+    }
+
+    async fn list_tenants(&self) -> Result<Vec<String>, BrokerError> {
+        Ok(self
+            .documents
+            .lock()
+            .unwrap()
+            .values()
+            .map(|document| document.tenant.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
     }
 
     async fn mark_delivery(

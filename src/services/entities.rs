@@ -153,11 +153,12 @@ pub async fn create(
         })
         .await?;
 
-    notifications::enqueue_notifications(
+    enqueue_local_notifications(
         state,
         &context.tenant,
+        &entity_id,
         &entity,
-        &EntityEvent {
+        EntityEvent {
             kind: EntityEventKind::Created,
             changed_attributes: changed_attribute_names(&entity),
         },
@@ -190,11 +191,12 @@ pub async fn delete(
         .delete(&context.tenant, entity_id)
         .await?;
 
-    notifications::enqueue_notifications(
+    enqueue_local_notifications(
         state,
         &context.tenant,
+        entity_id,
         &document.doc,
-        &EntityEvent {
+        EntityEvent {
             kind: EntityEventKind::Deleted,
             changed_attributes: changed_attribute_names(&document.doc),
         },
@@ -234,11 +236,12 @@ pub async fn merge(
         .replace(existing.clone())
         .await?;
 
-    notifications::enqueue_notifications(
+    enqueue_local_notifications(
         state,
         &context.tenant,
+        entity_id,
         &existing.doc,
-        &EntityEvent {
+        EntityEvent {
             kind: EntityEventKind::Updated,
             changed_attributes: changed_attribute_names(&patch),
         },
@@ -282,11 +285,12 @@ pub async fn replace(
         })
         .await?;
 
-    notifications::enqueue_notifications(
+    enqueue_local_notifications(
         state,
         &context.tenant,
+        entity_id,
         &entity,
-        &EntityEvent {
+        EntityEvent {
             kind: EntityEventKind::Updated,
             changed_attributes: changed_attribute_names(&entity),
         },
@@ -340,11 +344,12 @@ pub async fn append_attrs(
         .replace(existing.clone())
         .await?;
     if !result.updated.is_empty() {
-        notifications::enqueue_notifications(
+        enqueue_local_notifications(
             state,
             &context.tenant,
+            entity_id,
             &existing.doc,
-            &EntityEvent {
+            EntityEvent {
                 kind: EntityEventKind::Updated,
                 changed_attributes: result.updated.clone(),
             },
@@ -398,11 +403,12 @@ pub async fn update_attrs(
         .replace(existing.clone())
         .await?;
     if !result.updated.is_empty() {
-        notifications::enqueue_notifications(
+        enqueue_local_notifications(
             state,
             &context.tenant,
+            entity_id,
             &existing.doc,
-            &EntityEvent {
+            EntityEvent {
                 kind: EntityEventKind::Updated,
                 changed_attributes: result.updated.clone(),
             },
@@ -445,11 +451,12 @@ pub async fn patch_attr(
         .replace(existing.clone())
         .await?;
 
-    notifications::enqueue_notifications(
+    enqueue_local_notifications(
         state,
         &context.tenant,
+        entity_id,
         &existing.doc,
-        &EntityEvent {
+        EntityEvent {
             kind: EntityEventKind::Updated,
             changed_attributes: vec![attr_id.to_string()],
         },
@@ -487,11 +494,12 @@ pub async fn delete_attr(
         .replace(existing.clone())
         .await?;
 
-    notifications::enqueue_notifications(
+    enqueue_local_notifications(
         state,
         &context.tenant,
+        entity_id,
         &existing.doc,
-        &EntityEvent {
+        EntityEvent {
             kind: EntityEventKind::Updated,
             changed_attributes: vec![attr_id.to_string()],
         },
@@ -531,11 +539,12 @@ pub async fn replace_attr(
         .replace(existing.clone())
         .await?;
 
-    notifications::enqueue_notifications(
+    enqueue_local_notifications(
         state,
         &context.tenant,
+        entity_id,
         &existing.doc,
-        &EntityEvent {
+        EntityEvent {
             kind: EntityEventKind::Updated,
             changed_attributes: vec![attr_id.to_string()],
         },
@@ -575,7 +584,7 @@ pub async fn batch_create(
                 } else {
                     created.push(entity_id.clone());
                     result.success.push(entity_id.clone());
-                    docs.push(entity.clone());
+                    docs.push((entity_id.clone(), entity.clone()));
                     state
                         .repositories
                         .entities
@@ -595,12 +604,13 @@ pub async fn batch_create(
         }
     }
 
-    for entity in &docs {
-        notifications::enqueue_notifications(
+    for (entity_id, entity) in &docs {
+        enqueue_local_notifications(
             state,
             &context.tenant,
+            entity_id,
             entity,
-            &EntityEvent {
+            EntityEvent {
                 kind: EntityEventKind::Created,
                 changed_attributes: changed_attribute_names(entity),
             },
@@ -850,6 +860,23 @@ fn dedupe(items: Vec<Value>) -> Vec<Value> {
         }
     }
     deduped
+}
+
+async fn enqueue_local_notifications(
+    state: &AppState,
+    tenant: &str,
+    entity_id: &str,
+    entity: &Value,
+    event: EntityEvent,
+) -> Result<(), BrokerError> {
+    match event.kind {
+        EntityEventKind::Deleted => state.entity_watch.record_local_delete(tenant, entity_id),
+        EntityEventKind::Created | EntityEventKind::Updated => state
+            .entity_watch
+            .record_local_upsert(tenant, entity_id, entity),
+    }
+
+    notifications::enqueue_notifications(state, tenant, entity, &event).await
 }
 
 /// Builds linked-entity graph when query traversal requires it.

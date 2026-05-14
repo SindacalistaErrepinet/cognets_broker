@@ -2,7 +2,10 @@ use std::io;
 
 use actix_web::{App, HttpServer, middleware::Logger, web};
 use cognets_broker::{
-    api, app::state::AppState, config::AppConfig, persistence::defradb::DefraDbRepositories,
+    api,
+    app::{entity_watch, state::AppState},
+    config::AppConfig,
+    persistence::defradb::DefraDbRepositories,
 };
 
 #[actix_web::main]
@@ -12,8 +15,9 @@ async fn main() -> io::Result<()> {
 
     let config = AppConfig::from_env();
     let repositories = DefraDbRepositories::new(&config).map_err(io::Error::other)?;
-    let state =
-        web::Data::new(AppState::new(config.clone(), repositories).map_err(io::Error::other)?);
+    let state = AppState::new(config.clone(), repositories).map_err(io::Error::other)?;
+    entity_watch::spawn(state.clone());
+    let state = web::Data::new(state);
     let bind_address = format!("{}:{}", config.host, config.port);
 
     HttpServer::new(move || {
