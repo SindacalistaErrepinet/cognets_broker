@@ -5,7 +5,7 @@ use actix_web::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
@@ -16,12 +16,10 @@ use crate::{
         discovery::{AttributeInfo, AttributeList, EntityTypeInfo, EntityTypeList},
         temporal::TemporalQueryResult,
         types::{
-            ContextSourceIdentity, StoredDocument, SubscriptionDocument, SwarmMutationDocument,
-            TemporalEntityDocument,
+            ContextSourceIdentity, StoredDocument, SubscriptionDocument, TemporalEntityDocument,
         },
     },
     error::{BrokerError, ProblemDetails},
-    federation::p2p::SwimEventEnvelope,
     query::types::{
         AppendAttrsQuery, AttributeNamePath, BatchUpdateQuery, DeleteAttrQuery, DiscoveryQuery,
         EntityAttrInstancePath, EntityAttrPath, EntityIdPath, EntityQuery, EntityTypeQuery,
@@ -30,7 +28,7 @@ use crate::{
     },
     services::{
         common::{representation_from_request, resource_location, response_content_type},
-        discovery, entities, federation as federation_service, info, subscriptions, temporal,
+        discovery, entities, info, subscriptions, temporal,
     },
 };
 
@@ -60,14 +58,6 @@ struct StringListResponse {
     value: Vec<String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize, IntoParams, ToSchema)]
-#[into_params(parameter_in = Query)]
-struct SwarmMutationListQuery {
-    #[serde(rename = "sinceNanos")]
-    since_nanos: Option<i64>,
-    limit: Option<usize>,
-}
-
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -93,8 +83,6 @@ struct SwarmMutationListQuery {
         retrieve_subscription,
         update_subscription,
         delete_subscription,
-        post_internal_swim,
-        list_internal_swim_mutations,
         upsert_temporal_entity,
         query_temporal_entities,
         post_query_temporal_entities,
@@ -121,8 +109,6 @@ struct SwarmMutationListQuery {
         StoredDocument,
         TemporalEntityDocument,
         SubscriptionDocument,
-        SwarmMutationDocument,
-        SwimEventEnvelope,
         EntityTypeList,
         EntityTypeInfo,
         AttributeList,
@@ -137,7 +123,6 @@ struct SwarmMutationListQuery {
         BatchUpdateQuery,
         SubscriptionQuery,
         DiscoveryQuery,
-        SwarmMutationListQuery,
         TemporalEntityQuery,
         TemporalEntityQueryParams,
         JsonBody,
@@ -150,13 +135,12 @@ struct SwarmMutationListQuery {
         (name = "subscriptions", description = "Subscription CRUD endpoints"),
         (name = "temporal", description = "Temporal entity endpoints"),
         (name = "discovery", description = "Entity type and attribute discovery endpoints"),
-        (name = "info", description = "Context source identity endpoints"),
-        (name = "internal", description = "Internal SWIM and swarm sync endpoints")
+        (name = "info", description = "Context source identity endpoints")
     )
 )]
 pub struct ApiDoc;
 
-/// Registers public NGSI-LD routes and root-level internal routes.
+/// Registers public NGSI-LD routes.
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", ApiDoc::openapi()),
@@ -259,11 +243,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/attributes", web::get().to(list_attributes))
             .route("/attributes/{attrId}", web::get().to(get_attribute))
             .route("/info/sourceIdentity", web::get().to(get_source_identity)),
-    )
-    .route("/internal/swim", web::post().to(post_internal_swim))
-    .route(
-        "/internal/swim/mutations",
-        web::get().to(list_internal_swim_mutations),
     );
 }
 
@@ -1073,61 +1052,6 @@ async fn delete_subscription(
 }
 
 #[utoipa::path(
-    get,
-    path = "/internal/swim/mutations",
-    tag = "internal",
-    params(SwarmMutationListQuery),
-    responses(
-        (status = 200, description = "Swarm mutations returned", body = Vec<SwarmMutationDocument>),
-        (status = 500, description = "Internal error", body = ProblemDetails)
-    )
-)]
-/// Handles root-level internal mutation log reads.
-async fn list_internal_swim_mutations(
-    state: web::Data<AppState>,
-    request: HttpRequest,
-    query: web::Query<SwarmMutationListQuery>,
-) -> Result<HttpResponse, BrokerError> {
-    let context = RequestContext::from_request(&request);
-    let query = query.into_inner();
-    let mutations = federation_service::list_swarm_mutations_since(
-        state.get_ref(),
-        &context.tenant,
-        query.since_nanos,
-        query.limit.unwrap_or(200).min(1_000),
-    )
-    .await?;
-    Ok(HttpResponse::Ok()
-        .insert_header((HEADER_TENANT, context.tenant))
-        .json(mutations))
-}
-
-#[utoipa::path(
-    post,
-    path = "/internal/swim",
-    tag = "internal",
-    request_body = SwimEventEnvelope,
-    responses(
-        (status = 204, description = "SWIM event accepted"),
-        (status = 400, description = "Invalid request", body = ProblemDetails),
-        (status = 500, description = "Internal error", body = ProblemDetails)
-    )
-)]
-/// Handles root-level inbound SWIM events from peers.
-async fn post_internal_swim(
-    state: web::Data<AppState>,
-    request: HttpRequest,
-    body: web::Json<SwimEventEnvelope>,
-) -> Result<HttpResponse, BrokerError> {
-    let context = RequestContext::from_request(&request);
-    federation_service::accept_swim_event(state.get_ref(), &context.tenant, &body.into_inner())
-        .await?;
-    Ok(HttpResponse::NoContent()
-        .insert_header((HEADER_TENANT, context.tenant))
-        .finish())
-}
-
-#[utoipa::path(
     post,
     path = "/ngsi-ld/v1/temporal/entities",
     tag = "temporal",
@@ -1745,49 +1669,57 @@ fn apply_source_identity_context(body: &mut Value) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        net::TcpListener,
+        sync::{Arc, Mutex},
+    };
 
-    use actix_web::{App, http::StatusCode, test};
-    use mongodb::options::{ClientOptions, ServerAddress};
+    use actix_web::{App, HttpResponse, HttpServer, http::StatusCode, test, web};
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::{
-        config::AppConfig,
-        domain::types::{
-            PeerStatus, SwarmEventKind, SwarmMutationDocument, SwarmOperation, SwarmResourceKind,
-        },
-        federation::p2p::{SwimEventEnvelope, SwimEventKind, SwimPeer},
-        federation::queue::{InMemoryEventQueue, NotificationTargetKind, QueueMessage},
-        persistence::{mongo::MongoRepositories, repository::EntityRepository},
-    };
-
-    fn test_state_with_queue() -> (web::Data<AppState>, Arc<InMemoryEventQueue>) {
-        let mut config = AppConfig::for_tests();
-        config.p2p_enabled = false;
-
-        let mut options = ClientOptions::default();
-        options.hosts = vec![ServerAddress::Tcp {
-            host: "127.0.0.1".to_string(),
-            port: Some(27017),
-        }];
-        let client = mongodb::Client::with_options(options).unwrap();
-        let db = client.database(&config.mongo_database);
-        let repositories = MongoRepositories::new_without_indexes(&db);
-        let queue = Arc::new(InMemoryEventQueue::default());
-
-        (
-            web::Data::new(AppState::new(config, db, repositories, queue.clone()).unwrap()),
-            queue,
-        )
-    }
+    use crate::{config::AppConfig, persistence::memory};
 
     fn test_state() -> web::Data<AppState> {
-        test_state_with_queue().0
+        let config = AppConfig::for_tests();
+        web::Data::new(AppState::new(config, memory::repositories()).unwrap())
     }
 
     async fn response_body(response: actix_web::dev::ServiceResponse) -> Value {
         serde_json::from_slice(&test::read_body(response).await).unwrap()
+    }
+
+    async fn notification_sink(
+        received: web::Data<Arc<Mutex<Vec<Value>>>>,
+        body: web::Json<Value>,
+    ) -> HttpResponse {
+        received.lock().unwrap().push(body.into_inner());
+        HttpResponse::NoContent().finish()
+    }
+
+    async fn spawn_notification_server()
+    -> (String, Arc<Mutex<Vec<Value>>>, actix_web::dev::ServerHandle) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let sink = received.clone();
+
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(web::Data::new(sink.clone()))
+                .route("/notify", web::post().to(notification_sink))
+        })
+        .listen(listener)
+        .unwrap()
+        .run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+
+        (
+            format!("http://{}:{}/notify", address.ip(), address.port()),
+            received,
+            handle,
+        )
     }
 
     #[actix_web::test]
@@ -1908,30 +1840,26 @@ mod tests {
         assert!(
             body.get("paths")
                 .and_then(|paths| paths.get("/internal/swim"))
-                .is_some()
-        );
-        assert!(
-            body.get("paths")
-                .and_then(|paths| paths.get("/internal/swim/mutations"))
-                .is_some()
+                .is_none()
         );
     }
 
     #[actix_web::test]
-    async fn internal_swim_applies_mutation_enqueues_notification_and_lists_mutation() {
-        let (state, queue) = test_state_with_queue();
+    async fn create_entity_delivers_local_subscription_notification() {
+        let (endpoint, received, handle) = spawn_notification_server().await;
+        let state = test_state();
         let app = test::init_service(App::new().app_data(state.clone()).configure(configure)).await;
 
         let subscription_request = test::TestRequest::post()
             .uri("/ngsi-ld/v1/subscriptions")
             .set_json(json!({
-                "id": "urn:ngsi-ld:Subscription:swim-notify",
+                "id": "urn:ngsi-ld:Subscription:notify-local",
                 "type": "Subscription",
                 "entities": [{"type": "Vehicle"}],
                 "watchedAttributes": ["speed"],
                 "notification": {
                     "endpoint": {
-                        "uri": "http://listener.example/notify"
+                        "uri": endpoint
                     }
                 }
             }))
@@ -1939,100 +1867,78 @@ mod tests {
         let subscription_response = test::call_service(&app, subscription_request).await;
         assert_eq!(subscription_response.status(), StatusCode::CREATED);
 
-        let mutation = SwarmMutationDocument {
-            tenant: "default".to_string(),
-            mutation_id: "urn:ngsi-ld:SwarmMutation:peer-b:1".to_string(),
-            resource_kind: SwarmResourceKind::Entity,
-            operation: SwarmOperation::Upsert,
-            entity_id: "urn:ngsi-ld:Vehicle:swim-1".to_string(),
-            version_at: "2024-01-01T00:00:00Z".to_string(),
-            version_at_nanos: 1,
-            recorded_at: "2024-01-01T00:00:01Z".to_string(),
-            recorded_at_nanos: 2,
-            source_peer_id: "peer-b".to_string(),
-            event_kind: SwarmEventKind::Created,
-            changed_attributes: vec!["speed".to_string()],
-            snapshot: Some(json!({
-                "id": "urn:ngsi-ld:Vehicle:swim-1",
+        let create_request = test::TestRequest::post()
+            .uri("/ngsi-ld/v1/entities")
+            .set_json(json!({
+                "id": "urn:ngsi-ld:Vehicle:notify-1",
                 "type": "Vehicle",
-                "speed": {"type": "Property", "value": 50},
-                "createdAt": "2024-01-01T00:00:00Z",
-                "modifiedAt": "2024-01-01T00:00:00Z"
-            })),
-        };
-        let peer = SwimPeer {
-            peer_id: "peer-b".to_string(),
-            endpoint: "http://peer-b:1026/ngsi-ld/v1".to_string(),
-            aliases: vec!["peer-b".to_string()],
-            capabilities: vec!["swim".to_string()],
-            neighbors: Vec::new(),
-            status: PeerStatus::Alive,
-            incarnation: 1,
-            tenant: Some("default".to_string()),
-        };
-
-        let swim_request = test::TestRequest::post()
-            .uri("/internal/swim")
-            .set_json(SwimEventEnvelope {
-                kind: SwimEventKind::Mutation,
-                source: peer.clone(),
-                peer,
-                mutation: Some(mutation.clone()),
-                recorded_at: mutation.recorded_at.clone(),
-            })
+                "speed": {"type": "Property", "value": 50}
+            }))
             .to_request();
-        let swim_response = test::call_service(&app, swim_request).await;
-        assert_eq!(swim_response.status(), StatusCode::NO_CONTENT);
+        let create_response = test::call_service(&app, create_request).await;
+        assert_eq!(create_response.status(), StatusCode::CREATED);
 
         let stored = state
             .repositories
             .entities
-            .get("default", "urn:ngsi-ld:Vehicle:swim-1")
+            .get("default", "urn:ngsi-ld:Vehicle:notify-1")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
             stored.doc.get("id").and_then(Value::as_str),
-            Some("urn:ngsi-ld:Vehicle:swim-1")
+            Some("urn:ngsi-ld:Vehicle:notify-1")
         );
 
-        let messages = queue.messages();
-        assert_eq!(messages.len(), 1);
-        match &messages[0] {
-            QueueMessage::Notification(job) => {
-                assert_eq!(job.target_kind, NotificationTargetKind::Subscription);
-                assert_eq!(job.subscription_id, "urn:ngsi-ld:Subscription:swim-notify");
-                assert_eq!(
-                    job.payload.get("type").and_then(Value::as_str),
-                    Some("Notification")
-                );
-                assert_eq!(
-                    job.payload
-                        .get("data")
-                        .and_then(Value::as_array)
-                        .and_then(|items| items.first())
-                        .and_then(|item| item.get("id"))
-                        .and_then(Value::as_str),
-                    Some("urn:ngsi-ld:Vehicle:swim-1")
-                );
-            }
-            other => panic!("unexpected queue message: {other:?}"),
-        }
-
-        let list_request = test::TestRequest::get()
-            .uri("/internal/swim/mutations")
-            .to_request();
-        let list_response = test::call_service(&app, list_request).await;
-        assert_eq!(list_response.status(), StatusCode::OK);
-        let list_body = response_body(list_response).await;
+        let list_body = received.lock().unwrap().clone();
+        assert_eq!(list_body.len(), 1);
         assert_eq!(
-            list_body
-                .as_array()
-                .and_then(|items| items.first())
-                .and_then(|item| item.get("mutationId"))
-                .and_then(Value::as_str),
-            Some("urn:ngsi-ld:SwarmMutation:peer-b:1")
+            list_body[0].get("type").and_then(Value::as_str),
+            Some("Notification")
         );
+        assert_eq!(
+            list_body[0]
+                .get("data")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str),
+            Some("urn:ngsi-ld:Vehicle:notify-1")
+        );
+
+        let subscription = state
+            .repositories
+            .subscriptions
+            .get("default", "urn:ngsi-ld:Subscription:notify-local")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            subscription
+                .doc
+                .get("notification")
+                .and_then(|value| value.get("timesSent"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            subscription
+                .doc
+                .get("notification")
+                .and_then(|value| value.get("timesFailed"))
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert!(
+            subscription
+                .doc
+                .get("notification")
+                .and_then(|value| value.get("lastSuccess"))
+                .and_then(Value::as_str)
+                .is_some()
+        );
+
+        handle.stop(true).await;
     }
 
     #[actix_web::test]

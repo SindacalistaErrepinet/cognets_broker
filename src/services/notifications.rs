@@ -1,13 +1,13 @@
 use std::{collections::HashMap, sync::Arc};
 
+use log::warn;
 use serde_json::Value;
 
 use crate::{
     app::state::AppState,
+    context::headers::HEADER_TENANT,
     domain::types::{EntityEvent, EntityEventKind},
     error::BrokerError,
-    federation::queue::{NotificationEnvelope, NotificationTargetKind, QueueMessage},
-    persistence::repository::{EntityRepository, SubscriptionRepository},
     query::{
         context::resolve_context_terms,
         language::{
@@ -17,9 +17,10 @@ use crate::{
         },
     },
     services::common::build_notification_payload,
+    utils::time::now_timestamp,
 };
 
-/// Matches local subscriptions and enqueues outbound notifications.
+/// Matches local subscriptions and delivers notifications inline.
 pub async fn enqueue_notifications(
     state: &AppState,
     tenant: &str,
@@ -61,19 +62,41 @@ pub async fn enqueue_notifications(
             continue;
         };
 
-        state
-            .queue
-            .enqueue(QueueMessage::Notification(NotificationEnvelope {
-                tenant: tenant.to_string(),
-                subscription_id: subscription_id.to_string(),
-                target_kind: NotificationTargetKind::Subscription,
-                endpoint: endpoint.to_string(),
-                payload: build_notification_payload(subscription_id, &subscription.doc, entity),
-            }))
+        let payload = build_notification_payload(subscription_id, &subscription.doc, entity);
+        let response = state
+            .http_client
+            .post(endpoint)
+            .header(HEADER_TENANT, tenant)
+            .json(&payload)
+            .send()
+            .await;
+        let success = response
+            .as_ref()
+            .map(|response| response.status().is_success())
+            .unwrap_or(false);
+        let attempted_at = now_timestamp();
+
+        if let Err(error) = state
+            .repositories
+            .subscriptions
+            .mark_delivery(tenant, subscription_id, success, &attempted_at)
             .await
-            .map_err(|error| {
-                BrokerError::internal(format!("failed to enqueue notification: {error}"))
-            })?;
+        {
+            warn!("failed updating notification delivery state for {subscription_id}: {error}");
+        }
+
+        match response {
+            Ok(response) if !response.status().is_success() => {
+                warn!(
+                    "notification delivery failed for {subscription_id}: HTTP {}",
+                    response.status().as_u16()
+                );
+            }
+            Err(error) => {
+                warn!("notification delivery failed for {subscription_id}: {error}");
+            }
+            Ok(_) => {}
+        }
     }
 
     Ok(())

@@ -91,10 +91,3 @@ impl From<reqwest::Error> for BrokerError {
         Self::Internal(format!("outbound HTTP client error: {error}"))
     }
 }
-
-impl From<mongodb::error::Error> for BrokerError {
-    /// Converts MongoDB driver failures into internal errors.
-    fn from(error: mongodb::error::Error) -> Self {
-        Self::Internal(format!("mongodb error: {error}"))
-    }
-}

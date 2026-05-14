@@ -8,13 +8,9 @@ use crate::{
     context::headers::RequestContext,
     domain::{
         batch::{BatchEntityError, BatchOperationResult, NotUpdatedDetails, UpdateResult},
-        types::{
-            EntityEvent, EntityEventKind, StoredDocument, SwarmEventKind, SwarmOperation,
-            SwarmResourceKind,
-        },
+        types::{EntityEvent, EntityEventKind, StoredDocument},
     },
     error::{BrokerError, ProblemDetails},
-    persistence::repository::EntityRepository,
     query::{
         context::resolve_context_terms,
         planner::MongoQueryPlan,
@@ -27,7 +23,7 @@ use crate::{
             prepare_entity_for_create, prepare_entity_for_replace, project_entity,
             query_needs_linked_graph, representation_from_request, validate_entity,
         },
-        federation, notifications,
+        notifications,
     },
     utils::{
         json::{apply_merge_patch, editable_fragment_members},
@@ -126,12 +122,12 @@ pub async fn get(
     )))
 }
 
-/// Creates new entity, notifies subscriptions, and records swarm mutation.
+/// Creates new entity and notifies matching subscriptions.
 pub async fn create(
     state: &AppState,
     context: &RequestContext,
     mut entity: Value,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<String, BrokerError> {
     let entity_id = prepare_entity_for_create(&mut entity, context)?;
@@ -168,38 +164,16 @@ pub async fn create(
     )
     .await?;
 
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::Entity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.clone(),
-                version_at: entity
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Created,
-                changed_attributes: changed_attribute_names(&entity),
-                snapshot: Some(entity.clone()),
-            },
-        )
-        .await?;
-    }
-
     Ok(entity_id)
 }
 
-/// Deletes entity, emits notifications, and records swarm deletion.
+/// Deletes entity and emits notifications.
 pub async fn delete(
     state: &AppState,
     context: &RequestContext,
     entity_id: &str,
     requested_type: Option<&str>,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<(), BrokerError> {
     let document = state
@@ -227,40 +201,17 @@ pub async fn delete(
     )
     .await?;
 
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::Entity,
-                operation: SwarmOperation::Delete,
-                entity_id: entity_id.to_string(),
-                version_at: document
-                    .doc
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Deleted,
-                changed_attributes: changed_attribute_names(&document.doc),
-                snapshot: None,
-            },
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
-/// Applies merge patch to entity and records resulting mutation.
+/// Applies merge patch to entity.
 pub async fn merge(
     state: &AppState,
     context: &RequestContext,
     entity_id: &str,
     requested_type: Option<&str>,
     patch: Value,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<(), BrokerError> {
     ensure_fragment_id_matches(&patch, entity_id)?;
@@ -294,29 +245,6 @@ pub async fn merge(
     )
     .await?;
 
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::Entity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.to_string(),
-                version_at: existing
-                    .doc
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Updated,
-                changed_attributes: changed_attribute_names(&patch),
-                snapshot: Some(existing.doc.clone()),
-            },
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -327,7 +255,7 @@ pub async fn replace(
     entity_id: &str,
     requested_type: Option<&str>,
     mut entity: Value,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<(), BrokerError> {
     let existing = state
@@ -365,28 +293,6 @@ pub async fn replace(
     )
     .await?;
 
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::Entity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.to_string(),
-                version_at: entity
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Updated,
-                changed_attributes: changed_attribute_names(&entity),
-                snapshot: Some(entity.clone()),
-            },
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -398,7 +304,7 @@ pub async fn append_attrs(
     requested_type: Option<&str>,
     fragment: Value,
     no_overwrite: bool,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<UpdateResult, BrokerError> {
     ensure_fragment_id_matches(&fragment, entity_id)?;
@@ -445,28 +351,6 @@ pub async fn append_attrs(
         )
         .await?;
     }
-    if !local_only && !result.updated.is_empty() {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::Entity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.to_string(),
-                version_at: existing
-                    .doc
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Updated,
-                changed_attributes: result.updated.clone(),
-                snapshot: Some(existing.doc.clone()),
-            },
-        )
-        .await?;
-    }
 
     Ok(result)
 }
@@ -478,7 +362,7 @@ pub async fn update_attrs(
     entity_id: &str,
     requested_type: Option<&str>,
     fragment: Value,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<UpdateResult, BrokerError> {
     ensure_fragment_id_matches(&fragment, entity_id)?;
@@ -525,28 +409,6 @@ pub async fn update_attrs(
         )
         .await?;
     }
-    if !local_only && !result.updated.is_empty() {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::Entity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.to_string(),
-                version_at: existing
-                    .doc
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Updated,
-                changed_attributes: result.updated.clone(),
-                snapshot: Some(existing.doc.clone()),
-            },
-        )
-        .await?;
-    }
 
     Ok(result)
 }
@@ -559,7 +421,7 @@ pub async fn patch_attr(
     attr_id: &str,
     requested_type: Option<&str>,
     patch: Value,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<(), BrokerError> {
     let mut existing = state
@@ -593,29 +455,6 @@ pub async fn patch_attr(
         },
     )
     .await?;
-
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::Entity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.to_string(),
-                version_at: existing
-                    .doc
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Updated,
-                changed_attributes: vec![attr_id.to_string()],
-                snapshot: Some(existing.doc.clone()),
-            },
-        )
-        .await?;
-    }
     Ok(())
 }
 
@@ -626,7 +465,7 @@ pub async fn delete_attr(
     entity_id: &str,
     attr_id: &str,
     requested_type: Option<&str>,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<(), BrokerError> {
     let mut existing = state
@@ -659,29 +498,6 @@ pub async fn delete_attr(
     )
     .await?;
 
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::Entity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.to_string(),
-                version_at: existing
-                    .doc
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Updated,
-                changed_attributes: vec![attr_id.to_string()],
-                snapshot: Some(existing.doc.clone()),
-            },
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -693,7 +509,7 @@ pub async fn replace_attr(
     attr_id: &str,
     requested_type: Option<&str>,
     value: Value,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<(), BrokerError> {
     let mut existing = state
@@ -726,29 +542,6 @@ pub async fn replace_attr(
     )
     .await?;
 
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::Entity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.to_string(),
-                version_at: existing
-                    .doc
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Updated,
-                changed_attributes: vec![attr_id.to_string()],
-                snapshot: Some(existing.doc.clone()),
-            },
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -757,7 +550,7 @@ pub async fn batch_create(
     state: &AppState,
     context: &RequestContext,
     entities: Vec<Value>,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<Result<Vec<String>, BatchOperationResult>, BrokerError> {
     let mut created = Vec::new();
@@ -815,35 +608,6 @@ pub async fn batch_create(
         .await?;
     }
 
-    if !local_only && !docs.is_empty() {
-        for entity in &docs {
-            let entity_id = entity
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            federation::record_local_swarm_mutation(
-                state,
-                federation::SwarmMutationInput {
-                    tenant: context.tenant.clone(),
-                    resource_kind: SwarmResourceKind::Entity,
-                    operation: SwarmOperation::Upsert,
-                    entity_id,
-                    version_at: entity
-                        .get("modifiedAt")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    source_peer_id: state.config.broker_id.clone(),
-                    event_kind: SwarmEventKind::Created,
-                    changed_attributes: changed_attribute_names(entity),
-                    snapshot: Some(entity.clone()),
-                },
-            )
-            .await?;
-        }
-    }
-
     if result.errors.is_empty() {
         Ok(Ok(created))
     } else {
@@ -857,7 +621,7 @@ pub async fn batch_upsert(
     context: &RequestContext,
     entities: Vec<Value>,
     update_mode: bool,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<Result<crate::domain::batch::BatchUpsertOutcome, BatchOperationResult>, BrokerError> {
     let mut created_ids = Vec::new();
@@ -916,35 +680,6 @@ pub async fn batch_upsert(
         }
     }
 
-    if !local_only && !docs.is_empty() {
-        for entity in &docs {
-            let entity_id = entity
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            federation::record_local_swarm_mutation(
-                state,
-                federation::SwarmMutationInput {
-                    tenant: context.tenant.clone(),
-                    resource_kind: SwarmResourceKind::Entity,
-                    operation: SwarmOperation::Upsert,
-                    entity_id,
-                    version_at: entity
-                        .get("modifiedAt")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    source_peer_id: state.config.broker_id.clone(),
-                    event_kind: SwarmEventKind::Updated,
-                    changed_attributes: changed_attribute_names(entity),
-                    snapshot: Some(entity.clone()),
-                },
-            )
-            .await?;
-        }
-    }
-
     if result.errors.is_empty() {
         Ok(Ok(crate::domain::batch::BatchUpsertOutcome {
             created_ids,
@@ -961,7 +696,7 @@ pub async fn batch_update(
     context: &RequestContext,
     entities: Vec<Value>,
     no_overwrite: bool,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<Result<(), BatchOperationResult>, BrokerError> {
     let mut result = BatchOperationResult::default();
@@ -1010,35 +745,6 @@ pub async fn batch_update(
         }
     }
 
-    if !local_only && !docs.is_empty() {
-        for entity in &docs {
-            let entity_id = entity
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            federation::record_local_swarm_mutation(
-                state,
-                federation::SwarmMutationInput {
-                    tenant: context.tenant.clone(),
-                    resource_kind: SwarmResourceKind::Entity,
-                    operation: SwarmOperation::Upsert,
-                    entity_id,
-                    version_at: entity
-                        .get("modifiedAt")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    source_peer_id: state.config.broker_id.clone(),
-                    event_kind: SwarmEventKind::Updated,
-                    changed_attributes: changed_attribute_names(entity),
-                    snapshot: Some(entity.clone()),
-                },
-            )
-            .await?;
-        }
-    }
-
     if result.errors.is_empty() {
         Ok(Ok(()))
     } else {
@@ -1051,7 +757,7 @@ pub async fn batch_merge(
     state: &AppState,
     context: &RequestContext,
     entities: Vec<Value>,
-    local_only: bool,
+    _local_only: bool,
     query_string: Option<String>,
 ) -> Result<Result<(), BatchOperationResult>, BrokerError> {
     let mut result = BatchOperationResult::default();
@@ -1070,7 +776,7 @@ pub async fn batch_merge(
                 &entity_id,
                 None,
                 entity,
-                local_only,
+                false,
                 query_string.clone(),
             )
             .await
@@ -1102,7 +808,7 @@ pub async fn batch_delete(
     state: &AppState,
     context: &RequestContext,
     entity_ids: Vec<String>,
-    local_only: bool,
+    _local_only: bool,
     _query_string: Option<String>,
 ) -> Result<Result<(), BatchOperationResult>, BrokerError> {
     let mut result = BatchOperationResult::default();
@@ -1119,26 +825,6 @@ pub async fn batch_delete(
                 404,
                 format!("entity {entity_id} was not found"),
             )),
-        }
-    }
-
-    if !local_only && !result.success.is_empty() {
-        for entity_id in &result.success {
-            federation::record_local_swarm_mutation(
-                state,
-                federation::SwarmMutationInput {
-                    tenant: context.tenant.clone(),
-                    resource_kind: SwarmResourceKind::Entity,
-                    operation: SwarmOperation::Delete,
-                    entity_id: entity_id.clone(),
-                    version_at: now_timestamp(),
-                    source_peer_id: state.config.broker_id.clone(),
-                    event_kind: SwarmEventKind::Deleted,
-                    changed_attributes: Vec::new(),
-                    snapshot: None,
-                },
-            )
-            .await?;
         }
     }
 

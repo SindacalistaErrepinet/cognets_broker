@@ -1,14 +1,36 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use regex::Regex;
 use serde_json::Value;
 
 use crate::{
-    domain::types::{
-        PeerDocument, StoredDocument, SubscriptionDocument, SwarmMutationDocument,
-        TemporalEntityDocument,
-    },
+    domain::types::{StoredDocument, SubscriptionDocument, TemporalEntityDocument},
     error::BrokerError,
     query::planner::{GeoFilter, MongoQueryPlan, TemporalFilter},
 };
+
+#[derive(Clone)]
+pub struct Repositories {
+    pub entities: Arc<dyn EntityRepository>,
+    pub temporals: Arc<dyn TemporalRepository>,
+    pub subscriptions: Arc<dyn SubscriptionRepository>,
+}
+
+impl Repositories {
+    /// Bundles repository implementations used by application state.
+    pub fn new(
+        entities: Arc<dyn EntityRepository>,
+        temporals: Arc<dyn TemporalRepository>,
+        subscriptions: Arc<dyn SubscriptionRepository>,
+    ) -> Self {
+        Self {
+            entities,
+            temporals,
+            subscriptions,
+        }
+    }
+}
 
 #[async_trait]
 pub trait EntityRepository: Send + Sync {
@@ -92,38 +114,83 @@ pub trait SubscriptionRepository: Send + Sync {
     ) -> Result<(), BrokerError>;
 }
 
-#[async_trait]
-pub trait PeerRepository: Send + Sync {
-    /// Retrieves one peer membership record.
-    async fn get(&self, tenant: &str, peer_id: &str) -> Result<Option<PeerDocument>, BrokerError>;
-    /// Upserts peer membership record.
-    async fn upsert(&self, document: PeerDocument) -> Result<(), BrokerError>;
-    /// Lists all peers for tenant.
-    async fn list(&self, tenant: &str) -> Result<Vec<PeerDocument>, BrokerError>;
-}
-
-#[async_trait]
-pub trait SwarmMutationRepository: Send + Sync {
-    /// Retrieves one swarm mutation by tenant and mutation id.
-    async fn get(
-        &self,
-        tenant: &str,
-        mutation_id: &str,
-    ) -> Result<Option<SwarmMutationDocument>, BrokerError>;
-    /// Inserts new swarm mutation document.
-    async fn insert(&self, document: SwarmMutationDocument) -> Result<(), BrokerError>;
-    /// Lists mutation log entries after optional cursor.
-    async fn list_since(
-        &self,
-        tenant: &str,
-        since_nanos: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<SwarmMutationDocument>, BrokerError>;
-}
-
 /// Updates one top-level status field in JSON payload.
 pub fn update_status_field(document: &mut Value, field: &str, value: Value) {
     if let Some(object) = document.as_object_mut() {
         object.insert(field.to_string(), value);
+    }
+}
+
+/// Applies basic query-plan filters to entity wrapper documents.
+pub fn filter_entity_documents(
+    mut documents: Vec<StoredDocument>,
+    plan: &MongoQueryPlan,
+) -> Result<Vec<StoredDocument>, BrokerError> {
+    filter_documents(&mut documents, plan, |document| &document.doc)?;
+    Ok(documents)
+}
+
+/// Applies basic query-plan filters to temporal wrapper documents.
+pub fn filter_temporal_documents(
+    mut documents: Vec<TemporalEntityDocument>,
+    plan: &MongoQueryPlan,
+) -> Result<Vec<TemporalEntityDocument>, BrokerError> {
+    filter_documents(&mut documents, plan, |document| &document.doc)?;
+    Ok(documents)
+}
+
+fn filter_documents<T>(
+    documents: &mut Vec<T>,
+    plan: &MongoQueryPlan,
+    doc_of: impl Fn(&T) -> &Value,
+) -> Result<(), BrokerError> {
+    let id_pattern = plan
+        .id_pattern
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .map_err(|error| BrokerError::BadRequest(format!("invalid idPattern: {error}")))?;
+
+    documents.retain(|document| matches_query_plan(doc_of(document), plan, id_pattern.as_ref()));
+    if let Some(limit) = plan.limit {
+        documents.truncate(limit);
+    }
+    Ok(())
+}
+
+fn matches_query_plan(entity: &Value, plan: &MongoQueryPlan, id_pattern: Option<&Regex>) -> bool {
+    if !plan.ids.is_empty() {
+        let entity_id = entity.get("id").and_then(Value::as_str).unwrap_or_default();
+        if !plan.ids.iter().any(|candidate| candidate == entity_id) {
+            return false;
+        }
+    }
+
+    if !plan.entity_types.is_empty() {
+        let entity_type = entity.get("type");
+        if !plan
+            .entity_types
+            .iter()
+            .any(|candidate| entity_type_matches(entity_type, candidate))
+        {
+            return false;
+        }
+    }
+
+    if let Some(regex) = id_pattern {
+        let entity_id = entity.get("id").and_then(Value::as_str).unwrap_or_default();
+        if !regex.is_match(entity_id) {
+            return false;
+        }
+    }
+
+    plan.attrs.iter().all(|attr| entity.get(attr).is_some())
+}
+
+fn entity_type_matches(value: Option<&Value>, expected: &str) -> bool {
+    match value {
+        Some(Value::String(actual)) => actual == expected,
+        Some(Value::Array(items)) => items.iter().any(|item| item.as_str() == Some(expected)),
+        _ => false,
     }
 }

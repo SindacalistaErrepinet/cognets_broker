@@ -8,7 +8,6 @@ use crate::{
     context::headers::RequestContext,
     domain::discovery::{AttributeInfo, AttributeList, EntityTypeInfo, EntityTypeList},
     error::BrokerError,
-    persistence::repository::EntityRepository,
     query::planner::MongoQueryPlan,
     services::common::entity_primary_type,
     utils::json::entity_attribute_names,

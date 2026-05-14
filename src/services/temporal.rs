@@ -7,35 +7,28 @@ use crate::{
     context::headers::RequestContext,
     domain::{
         temporal::TemporalQueryResult,
-        types::{
-            SwarmEventKind, SwarmOperation, SwarmResourceKind, TemporalAttributeRecord,
-            TemporalEntityDocument,
-        },
+        types::{TemporalAttributeRecord, TemporalEntityDocument},
     },
     error::BrokerError,
-    persistence::repository::TemporalRepository,
     query::{
         context::resolve_context_terms,
         planner::{MongoQueryPlan, TemporalFilter},
         types::{Representation, TemporalEntityQuery},
     },
-    services::{
-        common::{
-            build_query_match_options, changed_attribute_names, entity_matches_query_with_options,
-            make_temporal_instance, prepare_entity_for_create, query_needs_linked_graph,
-            representation_from_request, temporal_entity_to_response,
-        },
-        federation,
+    services::common::{
+        build_query_match_options, entity_matches_query_with_options, make_temporal_instance,
+        prepare_entity_for_create, query_needs_linked_graph, representation_from_request,
+        temporal_entity_to_response,
     },
     utils::{json::editable_fragment_members, time::now_timestamp},
 };
 
-/// Creates or updates temporal entity and records swarm snapshot.
+/// Creates or updates temporal entity.
 pub async fn upsert(
     state: &AppState,
     context: &RequestContext,
     mut entity: Value,
-    local_only: bool,
+    _local_only: bool,
 ) -> Result<(String, bool), BrokerError> {
     let entity_id = prepare_entity_for_create(&mut entity, context)?;
     let history = temporal_history_from_entity(&entity);
@@ -49,37 +42,6 @@ pub async fn upsert(
             history,
         })
         .await?;
-
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::TemporalEntity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.clone(),
-                version_at: entity
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: if created {
-                    SwarmEventKind::Created
-                } else {
-                    SwarmEventKind::Updated
-                },
-                changed_attributes: changed_attribute_names(&entity),
-                snapshot: Some(temporal_snapshot(&TemporalEntityDocument {
-                    tenant: context.tenant.clone(),
-                    ngsi_id: entity_id.clone(),
-                    doc: entity.clone(),
-                    history: temporal_history_from_entity(&entity),
-                })),
-            },
-        )
-        .await?;
-    }
 
     Ok((entity_id, created))
 }
@@ -258,7 +220,7 @@ pub async fn delete_entity(
     state: &AppState,
     context: &RequestContext,
     entity_id: &str,
-    local_only: bool,
+    _local_only: bool,
 ) -> Result<(), BrokerError> {
     let deleted = state
         .repositories
@@ -271,34 +233,16 @@ pub async fn delete_entity(
         )));
     }
 
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::TemporalEntity,
-                operation: SwarmOperation::Delete,
-                entity_id: entity_id.to_string(),
-                version_at: now_timestamp(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Deleted,
-                changed_attributes: Vec::new(),
-                snapshot: None,
-            },
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
-/// Appends temporal attributes and snapshots updated history.
+/// Appends temporal attributes and updates history.
 pub async fn append_attrs(
     state: &AppState,
     context: &RequestContext,
     entity_id: &str,
     fragment: Value,
-    local_only: bool,
+    _local_only: bool,
 ) -> Result<(), BrokerError> {
     let mut document = state
         .repositories
@@ -323,29 +267,6 @@ pub async fn append_attrs(
         .upsert(document.clone())
         .await?;
 
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::TemporalEntity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.to_string(),
-                version_at: document
-                    .doc
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Updated,
-                changed_attributes: changed_attribute_names(&fragment),
-                snapshot: Some(temporal_snapshot(&document)),
-            },
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -355,7 +276,7 @@ pub async fn delete_attr(
     context: &RequestContext,
     entity_id: &str,
     attr_id: &str,
-    local_only: bool,
+    _local_only: bool,
 ) -> Result<(), BrokerError> {
     let mut document = state
         .repositories
@@ -377,29 +298,6 @@ pub async fn delete_attr(
         .upsert(document.clone())
         .await?;
 
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::TemporalEntity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.to_string(),
-                version_at: document
-                    .doc
-                    .get("modifiedAt")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Updated,
-                changed_attributes: vec![attr_id.to_string()],
-                snapshot: Some(temporal_snapshot(&document)),
-            },
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -411,7 +309,7 @@ pub async fn patch_instance(
     attr_id: &str,
     instance_id: &str,
     fragment: Value,
-    local_only: bool,
+    _local_only: bool,
 ) -> Result<(), BrokerError> {
     let mut document = state
         .repositories
@@ -450,24 +348,6 @@ pub async fn patch_instance(
         .upsert(document.clone())
         .await?;
 
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::TemporalEntity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.to_string(),
-                version_at: now_timestamp(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Updated,
-                changed_attributes: vec![attr_id.to_string()],
-                snapshot: Some(temporal_snapshot(&document)),
-            },
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -478,7 +358,7 @@ pub async fn delete_instance(
     entity_id: &str,
     attr_id: &str,
     instance_id: &str,
-    local_only: bool,
+    _local_only: bool,
 ) -> Result<(), BrokerError> {
     let mut document = state
         .repositories
@@ -505,23 +385,6 @@ pub async fn delete_instance(
         .temporals
         .upsert(document.clone())
         .await?;
-    if !local_only {
-        federation::record_local_swarm_mutation(
-            state,
-            federation::SwarmMutationInput {
-                tenant: context.tenant.clone(),
-                resource_kind: SwarmResourceKind::TemporalEntity,
-                operation: SwarmOperation::Upsert,
-                entity_id: entity_id.to_string(),
-                version_at: now_timestamp(),
-                source_peer_id: state.config.broker_id.clone(),
-                event_kind: SwarmEventKind::Updated,
-                changed_attributes: vec![attr_id.to_string()],
-                snapshot: Some(temporal_snapshot(&document)),
-            },
-        )
-        .await?;
-    }
 
     Ok(())
 }
@@ -721,24 +584,6 @@ fn record_to_value(record: TemporalAttributeRecord) -> Value {
     })
 }
 
-/// Embeds temporal history into mutation snapshot payload.
-fn temporal_snapshot(document: &TemporalEntityDocument) -> Value {
-    let mut snapshot = document.doc.clone();
-    if let Some(object) = snapshot.as_object_mut() {
-        object.insert(
-            "__swarmHistory".to_string(),
-            Value::Array(
-                document
-                    .history
-                    .iter()
-                    .filter_map(|record| serde_json::to_value(record).ok())
-                    .collect(),
-            ),
-        );
-    }
-    snapshot
-}
-
 /// Loads temporal entity document or returns not found.
 async fn get_temporal_document(
     state: &AppState,
@@ -908,33 +753,5 @@ mod tests {
         filter.time_at = "2024-01-02T00:00:00Z".to_string();
 
         assert!(temporal_matches(&record, &filter));
-    }
-
-    #[test]
-    fn temporal_snapshot_embeds_history_for_swarm_sync() {
-        let document = TemporalEntityDocument {
-            tenant: "tenant-a".to_string(),
-            ngsi_id: "urn:ngsi-ld:Vehicle:1".to_string(),
-            doc: json!({
-                "id": "urn:ngsi-ld:Vehicle:1",
-                "type": "Vehicle",
-                "speed": {"type": "Property", "value": 10.0}
-            }),
-            history: vec![record("speed", "i1", "2024-01-01T00:00:00Z", 10.0)],
-        };
-
-        let snapshot = temporal_snapshot(&document);
-
-        assert_eq!(
-            snapshot.get("id").and_then(Value::as_str),
-            Some("urn:ngsi-ld:Vehicle:1")
-        );
-        assert_eq!(
-            snapshot
-                .get("__swarmHistory")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(1)
-        );
     }
 }

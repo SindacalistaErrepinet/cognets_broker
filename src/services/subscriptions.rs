@@ -5,7 +5,6 @@ use crate::{
     context::headers::RequestContext,
     domain::types::SubscriptionDocument,
     error::BrokerError,
-    persistence::repository::SubscriptionRepository,
     query::types::{QueryResult, SubscriptionQuery},
     services::common::prepare_subscription,
     utils::{json::apply_merge_patch, time::now_timestamp},

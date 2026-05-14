@@ -4,7 +4,6 @@ pub mod config;
 pub mod context;
 pub mod domain;
 pub mod error;
-pub mod federation;
 pub mod persistence;
 pub mod query;
 pub mod services;

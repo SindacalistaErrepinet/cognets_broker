@@ -1,34 +1,20 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-use mongodb::Database;
 use reqwest::Client;
 
-use crate::{
-    config::AppConfig, error::BrokerError, federation::queue::EventQueue,
-    persistence::mongo::MongoRepositories,
-};
+use crate::{config::AppConfig, error::BrokerError, persistence::repository::Repositories};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
-    pub db: Database,
-    pub repositories: MongoRepositories,
-    pub queue: Arc<dyn EventQueue>,
+    pub repositories: Repositories,
     pub http_client: Client,
     pub started_at: Instant,
 }
 
 impl AppState {
     /// Creates shared application state and outbound HTTP client.
-    pub fn new(
-        config: AppConfig,
-        db: Database,
-        repositories: MongoRepositories,
-        queue: Arc<dyn EventQueue>,
-    ) -> Result<Self, BrokerError> {
+    pub fn new(config: AppConfig, repositories: Repositories) -> Result<Self, BrokerError> {
         let http_client = Client::builder()
             .timeout(Duration::from_millis(config.outbound_timeout_ms))
             .build()
@@ -38,9 +24,7 @@ impl AppState {
 
         Ok(Self {
             config,
-            db,
             repositories,
-            queue,
             http_client,
             started_at: Instant::now(),
         })
