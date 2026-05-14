@@ -1,3 +1,4 @@
+//! Time formatting and conversion helpers.
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};

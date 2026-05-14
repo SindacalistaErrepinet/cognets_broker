@@ -1,18 +1,28 @@
+//! HTTP header and request-context helpers.
 use actix_web::{HttpRequest, http::header};
 use serde_json::{Map, Value};
 
 use crate::{config::AppConfig, query::types::Representation};
 
+/// Default tenant used when request omits `NGSILD-Tenant`.
 pub const DEFAULT_TENANT: &str = "default";
+/// Tenant header used for tenant-scoped operations.
 pub const HEADER_TENANT: &str = "NGSILD-Tenant";
+/// Response header used for total-count reporting.
 pub const HEADER_RESULTS_COUNT: &str = "NGSILD-Results-Count";
+/// Standard HTTP `Link` header used for JSON-LD context backfill.
 pub const HEADER_LINK: &str = "Link";
+/// Standard HTTP `Via` header used for hop tracking.
 pub const HEADER_VIA: &str = "Via";
 
+/// Request-derived metadata shared across service calls.
 #[derive(Clone, Debug)]
 pub struct RequestContext {
+    /// Effective tenant name for request.
     pub tenant: String,
+    /// Parsed `Via` chain used for loop avoidance and forwarding.
     pub via: Vec<String>,
+    /// Raw `Link` header value when present.
     pub link_header: Option<String>,
 }
 

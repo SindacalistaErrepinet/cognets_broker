@@ -1,3 +1,4 @@
+//! JSON-LD context resolution helpers.
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use reqwest::Client;
@@ -6,6 +7,11 @@ use serde_json::Value;
 use crate::{context::headers::parse_context_link, error::BrokerError};
 
 /// Resolves compacted JSON-LD terms from inline and linked contexts.
+///
+/// Resolution walks local `@context` values plus optional `Link` header target,
+/// follows nested `@context` members breadth-first, fetches remote HTTP(S)
+/// contexts once, and returns compact-term to expanded-IRI mapping used by
+/// query evaluation.
 pub async fn resolve_context_terms(
     http_client: &Client,
     context_value: Option<&Value>,
@@ -75,7 +81,7 @@ pub async fn resolve_context_terms(
     Ok(terms)
 }
 
-/// Extracts expanded URI from single term definition entry.
+/// Extracts expanded URI from one term definition entry.
 fn term_definition_uri(definition: &Value) -> Option<&str> {
     match definition {
         Value::String(uri) => Some(uri),

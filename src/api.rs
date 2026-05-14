@@ -1,3 +1,8 @@
+//! HTTP route wiring and OpenAPI schema registration.
+//!
+//! This module is intentionally thin: handlers extract request context,
+//! delegate business logic to `services::*`, and translate service results into
+//! concrete HTTP responses.
 use actix_web::{
     HttpRequest, HttpResponse,
     http::{StatusCode, header},
@@ -32,27 +37,33 @@ use crate::{
     },
 };
 
+/// Core NGSI-LD context used by source-identity response when client requests
+/// JSON-LD content.
 const NGSI_LD_CORE_CONTEXT_V1_8: &str =
     "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.8.jsonld";
 
+/// OpenAPI-only wrapper for arbitrary JSON request bodies.
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 struct JsonBody {
     #[schema(value_type = Value)]
     value: Value,
 }
 
+/// OpenAPI-only wrapper for arrays of arbitrary JSON values.
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 struct JsonArrayBody {
     #[schema(value_type = Vec<Value>)]
     value: Vec<Value>,
 }
 
+/// OpenAPI-only wrapper for arbitrary JSON response bodies.
 #[derive(Debug, Serialize, ToSchema)]
 struct JsonResponseBody {
     #[schema(value_type = Value)]
     value: Value,
 }
 
+/// OpenAPI-only wrapper for string list responses.
 #[derive(Debug, Serialize, ToSchema)]
 struct StringListResponse {
     value: Vec<String>,
@@ -138,6 +149,7 @@ struct StringListResponse {
         (name = "info", description = "Context source identity endpoints")
     )
 )]
+/// Generated OpenAPI document for broker HTTP API.
 pub struct ApiDoc;
 
 /// Registers public NGSI-LD routes.

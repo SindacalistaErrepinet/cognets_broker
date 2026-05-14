@@ -1,14 +1,24 @@
+//! Runtime configuration loaded from environment variables.
 use std::env;
 
+/// Process-wide broker configuration.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
+    /// HTTP bind host for Actix server.
     pub host: String,
+    /// HTTP bind port for Actix server.
     pub port: u16,
+    /// Stable broker identifier used in headers and source identity output.
     pub broker_id: String,
+    /// Public NGSI-LD base endpoint exposed to peers and clients.
     pub public_endpoint: String,
+    /// DefraDB GraphQL endpoint used by runtime storage adapter.
     pub defradb_url: String,
+    /// Timeout for outbound HTTP requests in milliseconds.
     pub outbound_timeout_ms: u64,
+    /// Enables background entity watch polling worker.
     pub entity_watch_enabled: bool,
+    /// Polling interval for entity watch worker in milliseconds.
     pub entity_watch_interval_ms: u64,
 }
 

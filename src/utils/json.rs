@@ -1,3 +1,4 @@
+//! JSON and NGSI-LD payload helpers.
 use serde_json::{Map, Value};
 
 /// Applies RFC7386-style JSON merge patch in place.

@@ -1,3 +1,22 @@
+//! Local entity service operations.
+//!
+//! `src/api.rs` parses HTTP requests and routes them here. This module performs
+//! tenant-scoped entity reads and writes, keeps stored payloads normalized,
+//! applies query-time filtering that cannot be expressed entirely in storage,
+//! and triggers local subscription fan-out for single-entity write paths.
+//!
+//! Single-entity write helpers generally follow same flow: validate and
+//! normalize payload, persist under `context.tenant`, then record entity-watch
+//! state and enqueue matching notifications.
+//!
+//! Batch helpers intentionally use nested `Result`s. Outer `Err(BrokerError)`
+//! means infrastructure or request-level failure. Inner
+//! `Err(BatchOperationResult)` means request itself completed but one or more
+//! entities failed logically, which API layer maps to HTTP `207 Multi-Status`.
+//!
+//! Several signatures still carry `_local_only` and `_query_string` for API
+//! symmetry. Current implementation of this module does not branch on those
+//! values.
 use std::{collections::HashMap, sync::Arc};
 
 use actix_web::ResponseError;
@@ -13,7 +32,7 @@ use crate::{
     error::{BrokerError, ProblemDetails},
     query::{
         context::resolve_context_terms,
-        planner::MongoQueryPlan,
+        planner::QueryPlan,
         types::{EntityQuery, QueryResult, Representation},
     },
     services::{
@@ -31,7 +50,19 @@ use crate::{
     },
 };
 
-/// Queries local entities and applies NGSI-LD projection rules.
+/// Queries local entities for current tenant and projects them into response shape.
+///
+/// Flow:
+/// 1. Build repository query plan for filters storage can evaluate cheaply.
+/// 2. Load candidate documents from local tenant-scoped entity store.
+/// 3. Deduplicate payloads by logical entity id.
+/// 4. Resolve per-entity JSON-LD context and optional linked-entity graph data
+///    for in-memory `q` evaluation.
+/// 5. Apply NGSI-LD projection (`attrs`, `pick`, `omit`, representation) and
+///    limit.
+///
+/// `total_count` reflects number of entities that matched after in-memory
+/// filtering and before `limit` truncation.
 pub async fn query(
     state: &AppState,
     request: &actix_web::HttpRequest,
@@ -40,17 +71,24 @@ pub async fn query(
 ) -> Result<QueryResult, BrokerError> {
     let representation =
         representation_from_request(request, query.format.as_deref(), query.options.as_deref());
-    let plan = MongoQueryPlan::from_entity_query(query)?;
+    let plan = QueryPlan::from_entity_query(query)?;
     let items = state
         .repositories
         .entities
         .query(&context.tenant, &plan)
         .await?;
 
+    // Storage narrows candidate set first, but final NGSI-LD matching still runs
+    // against full payloads in memory. Collapse duplicate logical entities
+    // before that second pass.
     let entities = dedupe(items.into_iter().map(|item| item.doc).collect());
+    // Relationship traversal inside `q` expressions may need access to other
+    // entities from same tenant, not only current query candidates.
     let linked_entities = entity_query_linked_graph(state, context, query, &entities).await?;
     let mut matched = Vec::new();
     for entity in entities {
+        // Context terms are resolved per entity because `@context` can come from
+        // payload itself or from request `Link` header backfill.
         let options = build_query_match_options(
             query,
             resolve_context_terms(
@@ -68,6 +106,8 @@ pub async fn query(
     let entities = matched;
     let total_count = entities.len();
 
+    // Projection happens after filtering so predicates can still inspect full
+    // stored documents even when response asks for subset of attributes.
     let projected = entities
         .into_iter()
         .map(|entity| {
@@ -82,6 +122,8 @@ pub async fn query(
         .take(query.limit.unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
 
+    // GeoJSON needs `FeatureCollection` wrapper. Other representations return
+    // plain arrays of projected entities.
     let body = if representation == Representation::GeoJson {
         serde_json::json!({"type": "FeatureCollection", "features": projected})
     } else {
@@ -91,7 +133,11 @@ pub async fn query(
     Ok(QueryResult { body, total_count })
 }
 
-/// Retrieves single entity by id from local tenant store.
+/// Retrieves one entity by id from current tenant store.
+///
+/// This is direct point lookup, not broad query execution. After loading stored
+/// document it still enforces optional `type` selector and response projection
+/// so single-entity reads stay consistent with collection reads.
 pub async fn get(
     state: &AppState,
     request: &actix_web::HttpRequest,
@@ -122,7 +168,13 @@ pub async fn get(
     )))
 }
 
-/// Creates new entity and notifies matching subscriptions.
+/// Creates one new entity in current tenant.
+///
+/// `prepare_entity_for_create` validates payload, applies `Link`-header
+/// `@context` backfill when needed, stamps broker-managed timestamps, and
+/// returns canonical entity id. After conflict check, entity is stored as
+/// `StoredDocument { tenant, ngsi_id, doc }`, then local watch state and
+/// matching subscription notifications are enqueued.
 pub async fn create(
     state: &AppState,
     context: &RequestContext,
@@ -146,6 +198,7 @@ pub async fn create(
     state
         .repositories
         .entities
+        // Repository persists tenant wrapper plus raw NGSI-LD payload.
         .insert(StoredDocument {
             tenant: context.tenant.clone(),
             ngsi_id: entity_id.clone(),
@@ -168,7 +221,11 @@ pub async fn create(
     Ok(entity_id)
 }
 
-/// Deletes entity and emits notifications.
+/// Deletes one entity from current tenant.
+///
+/// Entity is loaded before deletion so service can enforce optional `type`
+/// selector and still have original payload available for delete-side
+/// notifications after repository row is removed.
 pub async fn delete(
     state: &AppState,
     context: &RequestContext,
@@ -206,7 +263,11 @@ pub async fn delete(
     Ok(())
 }
 
-/// Applies merge patch to entity.
+/// Applies JSON Merge Patch to existing entity.
+///
+/// Patch must target requested entity id when it carries `id`. After patching,
+/// broker reasserts managed fields such as `id` and `modifiedAt` before stored
+/// document is replaced and update notifications are emitted.
 pub async fn merge(
     state: &AppState,
     context: &RequestContext,
@@ -227,6 +288,8 @@ pub async fn merge(
 
     apply_merge_patch(&mut existing.doc, &patch);
     if let Some(object) = existing.doc.as_object_mut() {
+        // Merge Patch may delete or overwrite these keys, but broker keeps id
+        // stable and always advances entity-level modification timestamp.
         object.insert("id".to_string(), Value::String(entity_id.to_string()));
         object.insert("modifiedAt".to_string(), Value::String(now_timestamp()));
     }
@@ -251,7 +314,12 @@ pub async fn merge(
     Ok(())
 }
 
-/// Replaces entire entity document while preserving fixed metadata.
+/// Replaces full entity payload while preserving broker-managed invariants.
+///
+/// Replacement semantics are stricter than merge semantics: caller supplies full
+/// entity body, then `prepare_entity_for_replace` forces target `id`, preserves
+/// original `createdAt`, refreshes `modifiedAt`, clears stale `deletedAt`, and
+/// validates resulting payload before persistence.
 pub async fn replace(
     state: &AppState,
     context: &RequestContext,
@@ -268,6 +336,7 @@ pub async fn replace(
         .await?
         .ok_or_else(|| BrokerError::NotFound(format!("entity {entity_id} was not found")))?;
     ensure_requested_type(&existing.doc, requested_type)?;
+    // Full replacement keeps stable identity and original creation timestamp.
     prepare_entity_for_replace(
         &mut entity,
         entity_id,
@@ -300,7 +369,11 @@ pub async fn replace(
     Ok(())
 }
 
-/// Appends attributes and optionally rejects overwrites.
+/// Appends top-level attributes and optionally rejects overwrites.
+///
+/// `no_overwrite` converts existing-key collisions into `not_updated` entries
+/// instead of failing whole request. Successful keys are reported in `updated`
+/// and become notification `changed_attributes`.
 pub async fn append_attrs(
     state: &AppState,
     context: &RequestContext,
@@ -323,6 +396,8 @@ pub async fn append_attrs(
     let attrs = editable_fragment_members(&fragment);
     let mut result = UpdateResult::default();
     if let Some(object) = existing.doc.as_object_mut() {
+        // Attribute-level outcomes are accumulated so caller can return partial
+        // success information without aborting entire request at first conflict.
         for (key, value) in attrs {
             if no_overwrite && object.contains_key(&key) {
                 result.not_updated.push(not_updated(
@@ -360,7 +435,10 @@ pub async fn append_attrs(
     Ok(result)
 }
 
-/// Updates only attributes that already exist.
+/// Updates only top-level attributes that already exist.
+///
+/// Missing keys are accumulated in `not_updated`, allowing caller to return
+/// per-attribute partial outcome instead of aborting whole request.
 pub async fn update_attrs(
     state: &AppState,
     context: &RequestContext,
@@ -382,6 +460,8 @@ pub async fn update_attrs(
     let attrs = editable_fragment_members(&fragment);
     let mut result = UpdateResult::default();
     if let Some(object) = existing.doc.as_object_mut() {
+        // Unlike append, this path treats missing keys as logical errors and
+        // only mutates attributes already present on stored entity.
         for (key, value) in attrs {
             if object.contains_key(&key) {
                 object.insert(key.clone(), value);
@@ -419,7 +499,10 @@ pub async fn update_attrs(
     Ok(result)
 }
 
-/// Patches single attribute in place.
+/// Applies JSON Merge Patch to one existing top-level attribute.
+///
+/// Entity must exist, match optional `type` selector, and already contain
+/// `attr_id`. Entity-level `modifiedAt` is always advanced after patching.
 pub async fn patch_attr(
     state: &AppState,
     context: &RequestContext,
@@ -441,6 +524,8 @@ pub async fn patch_attr(
 
     if let Some(object) = existing.doc.as_object_mut() {
         if let Some(attribute) = object.get_mut(attr_id) {
+            // Patch is scoped to attribute payload only; entity metadata is
+            // refreshed separately below.
             apply_merge_patch(attribute, &patch);
         }
         object.insert("modifiedAt".to_string(), Value::String(now_timestamp()));
@@ -465,7 +550,10 @@ pub async fn patch_attr(
     Ok(())
 }
 
-/// Deletes one attribute from entity.
+/// Deletes one top-level attribute from existing entity.
+///
+/// Attribute existence is checked before mutation so function can return `404`
+/// without modifying entity state.
 pub async fn delete_attr(
     state: &AppState,
     context: &RequestContext,
@@ -509,7 +597,11 @@ pub async fn delete_attr(
     Ok(())
 }
 
-/// Replaces single attribute value.
+/// Replaces one top-level attribute value on existing entity.
+///
+/// This is direct replacement, not merge patching. Service still enforces entity
+/// existence, optional `type` selector, and pre-existing attribute check before
+/// mutating stored document.
 pub async fn replace_attr(
     state: &AppState,
     context: &RequestContext,
@@ -554,7 +646,16 @@ pub async fn replace_attr(
     Ok(())
 }
 
-/// Creates batch of entities and returns partial failure report when needed.
+/// Creates multiple entities sequentially for same tenant.
+///
+/// There is no transaction or rollback across items: each entity is validated,
+/// conflict-checked, and inserted inline. Successful inserts are remembered and
+/// notified after loop so side effects only run for documents that were actually
+/// persisted.
+///
+/// Outer `Err(BrokerError)` means infrastructure failure. Inner
+/// `Err(BatchOperationResult)` means request completed with logical per-entity
+/// failures and should be rendered as `207 Multi-Status`.
 pub async fn batch_create(
     state: &AppState,
     context: &RequestContext,
@@ -604,6 +705,8 @@ pub async fn batch_create(
         }
     }
 
+    // Deliver side effects only for writes that committed successfully during
+    // first pass; rejected entities never reach this loop.
     for (entity_id, entity) in &docs {
         enqueue_local_notifications(
             state,
@@ -625,7 +728,15 @@ pub async fn batch_create(
     }
 }
 
-/// Upserts batch of entities using merge or replace semantics.
+/// Upserts multiple entities sequentially.
+///
+/// Missing entities are created. Existing entities are either merge-patched
+/// (`update_mode = true`) or fully replaced after normalization
+/// (`update_mode = false`). Returned outcome tells API layer whether any new
+/// ids were created so it can choose between `201 Created` and `204 No Content`.
+///
+/// Current implementation persists inline and reports per-item success/failure;
+/// it does not perform a second notification pass.
 pub async fn batch_upsert(
     state: &AppState,
     context: &RequestContext,
@@ -649,6 +760,9 @@ pub async fn batch_upsert(
                     .await?;
                 if let Some(mut existing) = existing {
                     had_updates = true;
+                    // Update mode keeps untouched fields via Merge Patch.
+                    // Replace mode normalizes a fresh full document while
+                    // preserving broker-managed metadata.
                     if update_mode {
                         apply_merge_patch(&mut existing.doc, &entity);
                     } else {
@@ -701,6 +815,13 @@ pub async fn batch_upsert(
 }
 
 /// Applies partial updates to batch of existing entities.
+///
+/// Each payload must carry an `id`. Missing entities become batch errors.
+/// When `no_overwrite` is enabled, existing keys are left untouched silently
+/// instead of producing attribute-level error payloads.
+///
+/// Current implementation persists successful updates inline and only returns
+/// batch status summary.
 pub async fn batch_update(
     state: &AppState,
     context: &RequestContext,
@@ -732,6 +853,8 @@ pub async fn batch_update(
                 let attrs = editable_fragment_members(&entity);
                 if let Some(object) = existing.doc.as_object_mut() {
                     for (key, value) in attrs {
+                        // Batch `noOverwrite` behavior is silent skip rather
+                        // than per-attribute `notUpdated` reporting.
                         if no_overwrite && object.contains_key(&key) {
                             continue;
                         }
@@ -762,7 +885,11 @@ pub async fn batch_update(
     }
 }
 
-/// Applies JSON Merge Patch to batch of existing entities.
+/// Applies single-entity `merge` semantics across batch.
+///
+/// Each payload is validated first, then delegated to `merge`, so timestamp,
+/// id-reassertion, and notification behavior stay aligned with single-entity
+/// merge endpoint.
 pub async fn batch_merge(
     state: &AppState,
     context: &RequestContext,
@@ -813,7 +940,12 @@ pub async fn batch_merge(
     }
 }
 
-/// Deletes batch of entities and reports per-item failures.
+/// Deletes multiple entity ids and reports per-item failures.
+///
+/// Each id is attempted independently and successful deletions are not rolled
+/// back if later ids fail. This helper deletes directly by id from repository,
+/// so it does not fetch original payload first and therefore cannot apply
+/// optional type guards or emit delete notifications from this path.
 pub async fn batch_delete(
     state: &AppState,
     context: &RequestContext,
@@ -823,6 +955,8 @@ pub async fn batch_delete(
 ) -> Result<Result<(), BatchOperationResult>, BrokerError> {
     let mut result = BatchOperationResult::default();
     for entity_id in entity_ids.clone() {
+        // This path is intentionally direct repository delete, with no pre-load
+        // of full entity document.
         match state
             .repositories
             .entities
@@ -845,7 +979,11 @@ pub async fn batch_delete(
     }
 }
 
-/// Removes duplicate entity payloads by id.
+/// Removes duplicate logical entities while preserving first occurrence order.
+///
+/// Query planning can assemble overlapping candidate lists, so this helper
+/// defensively collapses payloads by `id` before in-memory filtering and
+/// projection.
 fn dedupe(items: Vec<Value>) -> Vec<Value> {
     let mut seen = std::collections::HashSet::new();
     let mut deduped = Vec::new();
@@ -869,6 +1007,8 @@ async fn enqueue_local_notifications(
     entity: &Value,
     event: EntityEvent,
 ) -> Result<(), BrokerError> {
+    // Local watch cache mirrors most recent broker-side observation so other
+    // components can reason about recent mutations without rereading storage.
     match event.kind {
         EntityEventKind::Deleted => state.entity_watch.record_local_delete(tenant, entity_id),
         EntityEventKind::Created | EntityEventKind::Updated => state
@@ -880,6 +1020,11 @@ async fn enqueue_local_notifications(
 }
 
 /// Builds linked-entity graph when query traversal requires it.
+///
+/// If `q` expression does not traverse relationships, this returns empty map and
+/// avoids full-tenant scan. When traversal is needed, current implementation
+/// loads all local entities for tenant, keys them by `id`, and then makes sure
+/// current query candidates are also present in graph.
 async fn entity_query_linked_graph(
     state: &AppState,
     context: &RequestContext,
@@ -890,10 +1035,12 @@ async fn entity_query_linked_graph(
         return Ok(Arc::default());
     }
 
+    // Linked-entity predicates can jump to arbitrary referenced entities, so
+    // current strategy is full local tenant scan keyed by logical entity id.
     let mut linked_entities = state
         .repositories
         .entities
-        .query(&context.tenant, &MongoQueryPlan::default())
+        .query(&context.tenant, &QueryPlan::default())
         .await?
         .into_iter()
         .map(|document| document.doc)
@@ -903,6 +1050,8 @@ async fn entity_query_linked_graph(
         })
         .collect::<HashMap<_, _>>();
 
+    // Seed graph with current candidates as well. This keeps map complete even
+    // if repository query above ever becomes narrower than candidate set.
     for entity in entities {
         if let Some(id) = entity.get("id").and_then(Value::as_str) {
             linked_entities
@@ -914,7 +1063,7 @@ async fn entity_query_linked_graph(
     Ok(Arc::new(linked_entities))
 }
 
-/// Builds batch error payload for multi-status responses.
+/// Constructs per-entity error payload used in batch `207 Multi-Status` bodies.
 fn batch_error(entity_id: &str, status: u16, detail: impl Into<String>) -> BatchEntityError {
     BatchEntityError {
         entity_id: entity_id.to_string(),
@@ -928,7 +1077,7 @@ fn batch_error(entity_id: &str, status: u16, detail: impl Into<String>) -> Batch
     }
 }
 
-/// Builds attribute-level update failure payload.
+/// Constructs per-attribute failure payload for append/update attribute APIs.
 fn not_updated(attribute_name: &str, status: u16, detail: impl Into<String>) -> NotUpdatedDetails {
     NotUpdatedDetails {
         attribute_name: attribute_name.to_string(),

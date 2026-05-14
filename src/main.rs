@@ -1,3 +1,4 @@
+//! Binary entrypoint for broker HTTP server.
 use std::io;
 
 use actix_web::{App, HttpServer, middleware::Logger, web};
@@ -8,8 +9,8 @@ use cognets_broker::{
     persistence::defradb::DefraDbRepositories,
 };
 
-#[actix_web::main]
 /// Boots repositories, workers, and HTTP server.
+#[actix_web::main]
 async fn main() -> io::Result<()> {
     env_logger::init();
 

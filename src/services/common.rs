@@ -1,3 +1,4 @@
+//! Shared service helpers for validation, projection, and response shaping.
 use std::sync::Arc;
 
 use actix_web::{HttpRequest, http::header};
@@ -21,6 +22,7 @@ use crate::{
     },
 };
 
+/// Root path for public NGSI-LD API routes.
 pub const BASE_PATH: &str = "/ngsi-ld/v1";
 
 /// Selects response representation from Accept, format, and options.

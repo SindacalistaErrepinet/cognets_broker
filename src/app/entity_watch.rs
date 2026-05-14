@@ -1,3 +1,8 @@
+//! Polling watcher for externally observed entity changes.
+//!
+//! Local write paths already enqueue notifications directly. This watcher exists
+//! for changes that arrive through shared storage from other broker instances or
+//! external writers.
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -11,18 +16,20 @@ use crate::{
     app::state::AppState,
     domain::types::{EntityEvent, EntityEventKind},
     error::BrokerError,
-    query::planner::MongoQueryPlan,
+    query::planner::QueryPlan,
     services::notifications,
     utils::json::{entity_attribute_names, reserved_member},
 };
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
+/// Internal key for one tenant-scoped entity snapshot.
 struct EntityKey {
     tenant: String,
     entity_id: String,
 }
 
 #[derive(Clone, Default)]
+/// Tracks locally written entities so polling worker can suppress duplicates.
 pub struct EntityWatchState {
     pending_local: Arc<Mutex<HashMap<EntityKey, Option<Value>>>>,
 }
@@ -60,7 +67,7 @@ impl EntityWatchState {
     }
 }
 
-/// Starts polling worker that turns DefraDB-replicated entity changes into local notifications.
+/// Starts polling worker that turns externally observed entity changes into notifications.
 pub fn spawn(state: AppState) {
     if !state.config.entity_watch_enabled {
         return;
@@ -74,6 +81,7 @@ pub fn spawn(state: AppState) {
     });
 }
 
+/// Polls storage for current entity snapshots and emits inferred events.
 async fn entity_watch_loop(state: AppState, interval: Duration) -> Result<(), BrokerError> {
     info!("entity watch worker started");
     let mut previous = HashMap::new();
@@ -149,6 +157,7 @@ async fn entity_watch_loop(state: AppState, interval: Duration) -> Result<(), Br
     }
 }
 
+/// Collects current entity snapshots for all tenants that matter to watcher.
 async fn collect_snapshots(state: &AppState) -> Result<HashMap<EntityKey, Value>, BrokerError> {
     let tenants = watched_tenants(state).await?;
     let mut snapshots = HashMap::new();
@@ -157,7 +166,7 @@ async fn collect_snapshots(state: &AppState) -> Result<HashMap<EntityKey, Value>
         let documents = state
             .repositories
             .entities
-            .query(&tenant, &MongoQueryPlan::default())
+            .query(&tenant, &QueryPlan::default())
             .await?;
         for document in documents {
             snapshots.insert(key(&tenant, &document.ngsi_id), document.doc);
@@ -167,6 +176,7 @@ async fn collect_snapshots(state: &AppState) -> Result<HashMap<EntityKey, Value>
     Ok(snapshots)
 }
 
+/// Returns tenants that currently have entities or subscriptions.
 async fn watched_tenants(state: &AppState) -> Result<Vec<String>, BrokerError> {
     let mut tenants = HashSet::new();
     tenants.extend(state.repositories.entities.list_tenants().await?);
@@ -174,6 +184,7 @@ async fn watched_tenants(state: &AppState) -> Result<Vec<String>, BrokerError> {
     Ok(tenants.into_iter().collect())
 }
 
+/// Computes changed top-level attribute names between two entity snapshots.
 fn diff_attributes(previous: &Value, current: &Value) -> Vec<String> {
     let previous = previous
         .as_object()
@@ -197,6 +208,7 @@ fn diff_attributes(previous: &Value, current: &Value) -> Vec<String> {
     changed.into_iter().collect()
 }
 
+/// Builds tenant-scoped entity key.
 fn key(tenant: &str, entity_id: &str) -> EntityKey {
     EntityKey {
         tenant: tenant.to_string(),

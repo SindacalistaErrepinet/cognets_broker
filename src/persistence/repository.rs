@@ -1,3 +1,8 @@
+//! Storage abstraction shared by application services.
+//!
+//! Services talk to these traits instead of concrete backends. This keeps core
+//! broker logic independent from in-memory test storage and DefraDB-backed
+//! runtime storage.
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,13 +12,17 @@ use serde_json::Value;
 use crate::{
     domain::types::{StoredDocument, SubscriptionDocument, TemporalEntityDocument},
     error::BrokerError,
-    query::planner::{GeoFilter, MongoQueryPlan, TemporalFilter},
+    query::planner::{GeoFilter, QueryPlan, TemporalFilter},
 };
 
+/// Bundle of repository implementations used by shared application state.
 #[derive(Clone)]
 pub struct Repositories {
+    /// Entity snapshot storage.
     pub entities: Arc<dyn EntityRepository>,
+    /// Temporal entity storage.
     pub temporals: Arc<dyn TemporalRepository>,
+    /// Subscription storage.
     pub subscriptions: Arc<dyn SubscriptionRepository>,
 }
 
@@ -33,6 +42,7 @@ impl Repositories {
 }
 
 #[async_trait]
+/// Entity storage operations scoped by tenant and logical entity id.
 pub trait EntityRepository: Send + Sync {
     /// Retrieves one entity document by tenant and id.
     async fn get(
@@ -50,17 +60,18 @@ pub trait EntityRepository: Send + Sync {
         tenant: &str,
         entity_id: &str,
     ) -> Result<Option<StoredDocument>, BrokerError>;
-    /// Queries entity documents using prepared Mongo query plan.
+    /// Queries entity documents using prepared query plan.
     async fn query(
         &self,
         tenant: &str,
-        plan: &MongoQueryPlan,
+        plan: &QueryPlan,
     ) -> Result<Vec<StoredDocument>, BrokerError>;
     /// Lists tenants currently present in entity storage.
     async fn list_tenants(&self) -> Result<Vec<String>, BrokerError>;
 }
 
 #[async_trait]
+/// Temporal entity storage operations.
 pub trait TemporalRepository: Send + Sync {
     /// Retrieves one temporal entity document by tenant and id.
     async fn get(
@@ -76,13 +87,14 @@ pub trait TemporalRepository: Send + Sync {
     async fn query(
         &self,
         tenant: &str,
-        plan: &MongoQueryPlan,
+        plan: &QueryPlan,
         temporal: &TemporalFilter,
         geo: Option<&GeoFilter>,
     ) -> Result<Vec<TemporalEntityDocument>, BrokerError>;
 }
 
 #[async_trait]
+/// Subscription storage and delivery-accounting operations.
 pub trait SubscriptionRepository: Send + Sync {
     /// Retrieves one subscription by tenant and id.
     async fn get(
@@ -128,7 +140,7 @@ pub fn update_status_field(document: &mut Value, field: &str, value: Value) {
 /// Applies basic query-plan filters to entity wrapper documents.
 pub fn filter_entity_documents(
     mut documents: Vec<StoredDocument>,
-    plan: &MongoQueryPlan,
+    plan: &QueryPlan,
 ) -> Result<Vec<StoredDocument>, BrokerError> {
     filter_documents(&mut documents, plan, |document| &document.doc)?;
     Ok(documents)
@@ -137,7 +149,7 @@ pub fn filter_entity_documents(
 /// Applies basic query-plan filters to temporal wrapper documents.
 pub fn filter_temporal_documents(
     mut documents: Vec<TemporalEntityDocument>,
-    plan: &MongoQueryPlan,
+    plan: &QueryPlan,
 ) -> Result<Vec<TemporalEntityDocument>, BrokerError> {
     filter_documents(&mut documents, plan, |document| &document.doc)?;
     Ok(documents)
@@ -145,7 +157,7 @@ pub fn filter_temporal_documents(
 
 fn filter_documents<T>(
     documents: &mut Vec<T>,
-    plan: &MongoQueryPlan,
+    plan: &QueryPlan,
     doc_of: impl Fn(&T) -> &Value,
 ) -> Result<(), BrokerError> {
     let id_pattern = plan
@@ -162,7 +174,7 @@ fn filter_documents<T>(
     Ok(())
 }
 
-fn matches_query_plan(entity: &Value, plan: &MongoQueryPlan, id_pattern: Option<&Regex>) -> bool {
+fn matches_query_plan(entity: &Value, plan: &QueryPlan, id_pattern: Option<&Regex>) -> bool {
     if !plan.ids.is_empty() {
         let entity_id = entity.get("id").and_then(Value::as_str).unwrap_or_default();
         if !plan.ids.iter().any(|candidate| candidate == entity_id) {

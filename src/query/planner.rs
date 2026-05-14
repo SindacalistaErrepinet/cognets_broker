@@ -1,3 +1,8 @@
+//! Query planning helpers.
+//!
+//! This module converts NGSI-LD request parameters into reusable filter objects.
+//! Service code uses [`QueryPlan`] to narrow candidate documents before running
+//! richer in-memory query evaluation.
 use bson::{Document, doc};
 use regex::Regex;
 use serde_json::{Value, json};
@@ -10,39 +15,61 @@ use crate::{
     },
 };
 
+/// Repository-facing filter plan derived from entity query parameters.
 #[derive(Debug, Clone, Default)]
-pub struct MongoQueryPlan {
+pub struct QueryPlan {
+    /// Explicit entity ids requested by caller.
     pub ids: Vec<String>,
+    /// Allowed entity types requested by caller.
     pub entity_types: Vec<String>,
+    /// Optional regex string applied to entity ids.
     pub id_pattern: Option<String>,
+    /// Attributes that must exist on candidate entities.
     pub attrs: Vec<String>,
+    /// Parsed `q` expression kept for later in-memory evaluation.
     pub q_expression: Option<QExpression>,
+    /// Parsed geo filter when request includes geo clauses.
     pub geo: Option<GeoFilter>,
+    /// Result limit that can be pushed into storage-side filtering safely.
     pub limit: Option<usize>,
 }
 
+/// Parsed geo constraint from entity query parameters.
 #[derive(Debug, Clone)]
 pub struct GeoFilter {
+    /// GeoJSON geometry type such as `Point` or `Polygon`.
     pub geometry: String,
+    /// NGSI-LD georel operator string.
     pub georel: String,
+    /// Target entity property that holds geometry value.
     pub geoproperty: String,
+    /// Parsed GeoJSON coordinates payload.
     pub coordinates: Value,
 }
 
+/// Parsed temporal window and projection settings.
 #[derive(Debug, Clone)]
 pub struct TemporalFilter {
+    /// Timestamp member used to compare history records.
     pub time_property: String,
+    /// Temporal relation such as `before`, `after`, or `between`.
     pub time_rel: String,
+    /// Lower-bound or anchor timestamp from request.
     pub time_at: String,
+    /// Upper-bound timestamp for `between` queries.
     pub end_time_at: Option<String>,
+    /// Optional `lastN` truncation applied after filtering.
     pub last_n: Option<u32>,
+    /// Requested aggregation methods for aggregated views.
     pub aggr_methods: Vec<String>,
+    /// Optional aggregation bucket duration.
     pub aggr_period_duration: Option<String>,
+    /// Temporal response representation to render.
     pub representation: Representation,
 }
 
-impl MongoQueryPlan {
-    /// Builds Mongo query plan from NGSI-LD entity query parameters.
+impl QueryPlan {
+    /// Builds repository query plan from NGSI-LD entity query parameters.
     pub fn from_entity_query(query: &EntityQuery) -> Result<Self, BrokerError> {
         let q_expression = parse_q_expression(query.q.as_deref())?;
         let _ = parse_scope_expression(query.scope_q.as_deref())?;
@@ -67,7 +94,7 @@ impl MongoQueryPlan {
         })
     }
 
-    /// Converts query plan into MongoDB filter document.
+    /// Converts query plan into BSON filter document used by current backend.
     pub fn to_bson_filter(&self, tenant: &str) -> Result<Document, BrokerError> {
         let mut clauses = vec![doc! {"tenant": tenant}];
 
@@ -116,7 +143,7 @@ impl MongoQueryPlan {
 }
 
 impl GeoFilter {
-    /// Converts geo filter into MongoDB geospatial predicate.
+    /// Converts geo filter into BSON geospatial predicate used by current backend.
     pub fn to_bson(&self) -> Result<Document, BrokerError> {
         let property = format!("doc.{}.value", self.geoproperty);
         let geo_json = match self.geometry.as_str() {
@@ -172,7 +199,7 @@ impl GeoFilter {
                 "equals" => "$geoIntersects",
                 "disjoint" => {
                     return Err(BrokerError::NotImplemented(
-                        "georel disjoint is not supported by the Mongo query planner".to_string(),
+                        "georel disjoint is not supported by current query planner".to_string(),
                     ));
                 }
                 other => {
@@ -318,7 +345,7 @@ mod tests {
             ..Default::default()
         };
 
-        let plan = MongoQueryPlan::from_entity_query(&query)?;
+        let plan = QueryPlan::from_entity_query(&query)?;
         let filter = plan.to_bson_filter("tenant-a")?;
 
         assert_eq!(

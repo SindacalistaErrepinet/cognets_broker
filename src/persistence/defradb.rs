@@ -1,3 +1,8 @@
+//! DefraDB-backed repository implementations.
+//!
+//! This module stores opaque NGSI-LD payloads through DefraDB's GraphQL API and
+//! applies additional filtering in process when storage-side filtering is not
+//! expressive enough for full NGSI-LD semantics.
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,7 +19,7 @@ use crate::{
         EntityRepository, Repositories, SubscriptionRepository, TemporalRepository,
         filter_entity_documents, filter_temporal_documents, update_status_field,
     },
-    query::planner::{GeoFilter, MongoQueryPlan, TemporalFilter},
+    query::planner::{GeoFilter, QueryPlan, TemporalFilter},
 };
 
 const ENTITY_COLLECTION: &str = "EntityRecord";
@@ -40,12 +45,14 @@ impl DefraDbRepositories {
 }
 
 #[derive(Clone)]
+/// Small GraphQL client wrapper used by DefraDB repositories.
 struct DefraDbClient {
     http: Client,
     graphql_url: String,
 }
 
 impl DefraDbClient {
+    /// Creates GraphQL client with configured request timeout.
     fn new(graphql_url: &str, timeout_ms: u64) -> Result<Self, BrokerError> {
         Ok(Self {
             http: Client::builder()
@@ -58,6 +65,7 @@ impl DefraDbClient {
         })
     }
 
+    /// Executes GraphQL request and extracts typed `data` payload.
     async fn execute<T: DeserializeOwned>(
         &self,
         query: &str,
@@ -108,17 +116,20 @@ impl DefraDbClient {
 }
 
 #[derive(Debug, Deserialize)]
+/// Generic GraphQL response envelope.
 struct GraphQlResponse<T> {
     data: Option<T>,
     errors: Option<Vec<GraphQlError>>,
 }
 
 #[derive(Debug, Deserialize)]
+/// GraphQL error item returned by DefraDB.
 struct GraphQlError {
     message: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+/// Opaque row used for entity and subscription records.
 struct OpaqueRecordRow {
     #[serde(rename = "_docID")]
     doc_id: String,
@@ -129,6 +140,7 @@ struct OpaqueRecordRow {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+/// Row used for temporal records with snapshot plus encoded history.
 struct TemporalRecordRow {
     #[serde(rename = "_docID")]
     doc_id: String,
@@ -141,6 +153,7 @@ struct TemporalRecordRow {
 }
 
 #[derive(Clone)]
+/// DefraDB-backed entity repository.
 pub struct DefraDbEntityRepository {
     client: Arc<DefraDbClient>,
 }
@@ -231,7 +244,7 @@ impl EntityRepository for DefraDbEntityRepository {
     async fn query(
         &self,
         tenant: &str,
-        plan: &MongoQueryPlan,
+        plan: &QueryPlan,
     ) -> Result<Vec<StoredDocument>, BrokerError> {
         let rows = list_opaque_records(&self.client, ENTITY_COLLECTION, tenant).await?;
         let documents = rows
@@ -247,6 +260,7 @@ impl EntityRepository for DefraDbEntityRepository {
 }
 
 #[derive(Clone)]
+/// DefraDB-backed temporal repository.
 pub struct DefraDbTemporalRepository {
     client: Arc<DefraDbClient>,
 }
@@ -308,7 +322,7 @@ impl TemporalRepository for DefraDbTemporalRepository {
     async fn query(
         &self,
         tenant: &str,
-        plan: &MongoQueryPlan,
+        plan: &QueryPlan,
         _temporal: &TemporalFilter,
         _geo: Option<&GeoFilter>,
     ) -> Result<Vec<TemporalEntityDocument>, BrokerError> {
@@ -322,6 +336,7 @@ impl TemporalRepository for DefraDbTemporalRepository {
 }
 
 #[derive(Clone)]
+/// DefraDB-backed subscription repository.
 pub struct DefraDbSubscriptionRepository {
     client: Arc<DefraDbClient>,
 }
@@ -491,6 +506,7 @@ impl SubscriptionRepository for DefraDbSubscriptionRepository {
     }
 }
 
+/// Finds one opaque record by tenant and logical id.
 async fn find_opaque_record(
     client: &DefraDbClient,
     collection: &str,
@@ -506,6 +522,7 @@ async fn find_opaque_record(
     Ok(data.records.into_iter().next())
 }
 
+/// Lists opaque records for one tenant.
 async fn list_opaque_records(
     client: &DefraDbClient,
     collection: &str,
@@ -518,6 +535,7 @@ async fn list_opaque_records(
     Ok(data.records)
 }
 
+/// Lists distinct tenant values present in one collection.
 async fn list_distinct_tenants(
     client: &DefraDbClient,
     collection: &str,
@@ -534,6 +552,7 @@ async fn list_distinct_tenants(
     Ok(tenants)
 }
 
+/// Creates one opaque record row in target collection.
 async fn create_opaque_record(
     client: &DefraDbClient,
     collection: &str,
@@ -553,6 +572,7 @@ async fn create_opaque_record(
     Ok(())
 }
 
+/// Updates one opaque record row in target collection.
 async fn update_opaque_record(
     client: &DefraDbClient,
     collection: &str,
@@ -573,6 +593,7 @@ async fn update_opaque_record(
     Ok(())
 }
 
+/// Deletes one opaque record row by internal document id.
 async fn delete_opaque_record(
     client: &DefraDbClient,
     collection: &str,
@@ -584,6 +605,7 @@ async fn delete_opaque_record(
     Ok(())
 }
 
+/// Finds one temporal record by tenant and logical id.
 async fn find_temporal_record(
     client: &DefraDbClient,
     tenant: &str,
@@ -600,6 +622,7 @@ async fn find_temporal_record(
     Ok(data.records.into_iter().next())
 }
 
+/// Lists temporal records for one tenant.
 async fn list_temporal_records(
     client: &DefraDbClient,
     tenant: &str,
@@ -615,6 +638,7 @@ async fn list_temporal_records(
     Ok(data.records)
 }
 
+/// Creates one temporal record row.
 async fn create_temporal_record(
     client: &DefraDbClient,
     tenant: &str,
@@ -638,6 +662,7 @@ async fn create_temporal_record(
     Ok(())
 }
 
+/// Updates one temporal record row.
 async fn update_temporal_record(
     client: &DefraDbClient,
     doc_id: &str,
@@ -663,6 +688,7 @@ async fn update_temporal_record(
     Ok(())
 }
 
+/// Deletes one temporal record row by internal document id.
 async fn delete_temporal_record(client: &DefraDbClient, doc_id: &str) -> Result<(), BrokerError> {
     let _: Value = client
         .execute(
@@ -698,6 +724,7 @@ struct TemporalRecordListData {
     records: Vec<TemporalRecordRow>,
 }
 
+/// Decodes entity wrapper from opaque storage row.
 fn decode_entity_row(row: OpaqueRecordRow) -> Result<StoredDocument, BrokerError> {
     Ok(StoredDocument {
         tenant: row.tenant,
@@ -706,6 +733,7 @@ fn decode_entity_row(row: OpaqueRecordRow) -> Result<StoredDocument, BrokerError
     })
 }
 
+/// Decodes subscription wrapper from opaque storage row.
 fn decode_subscription_row(row: OpaqueRecordRow) -> Result<SubscriptionDocument, BrokerError> {
     Ok(SubscriptionDocument {
         tenant: row.tenant,
@@ -714,6 +742,7 @@ fn decode_subscription_row(row: OpaqueRecordRow) -> Result<SubscriptionDocument,
     })
 }
 
+/// Decodes temporal wrapper from storage row.
 fn decode_temporal_row(row: TemporalRecordRow) -> Result<TemporalEntityDocument, BrokerError> {
     Ok(TemporalEntityDocument {
         tenant: row.tenant,
@@ -723,11 +752,13 @@ fn decode_temporal_row(row: TemporalRecordRow) -> Result<TemporalEntityDocument,
     })
 }
 
+/// Serializes payload into string field stored in DefraDB.
 fn encode_json<T: Serialize>(value: &T, label: &str) -> Result<String, BrokerError> {
     serde_json::to_string(value)
         .map_err(|error| BrokerError::internal(format!("failed encoding {label}: {error}")))
 }
 
+/// Deserializes payload stored as string field in DefraDB.
 fn decode_json<T: DeserializeOwned>(value: &str, label: &str) -> Result<T, BrokerError> {
     serde_json::from_str(value)
         .map_err(|error| BrokerError::internal(format!("failed decoding {label}: {error}")))

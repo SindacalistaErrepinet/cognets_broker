@@ -1,3 +1,4 @@
+//! Shared broker error types and HTTP response mapping.
 use actix_web::{
     HttpResponse, ResponseError,
     http::{StatusCode, header::ContentType},
@@ -6,6 +7,7 @@ use serde::Serialize;
 use thiserror::Error;
 use utoipa::ToSchema;
 
+/// Broker-level error variants returned by services and handlers.
 #[derive(Debug, Error)]
 pub enum BrokerError {
     #[error("{0}")]
@@ -20,6 +22,7 @@ pub enum BrokerError {
     Internal(String),
 }
 
+/// RFC 7807-style problem payload returned to API clients.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProblemDetails {
     #[serde(skip_serializing_if = "Option::is_none")]

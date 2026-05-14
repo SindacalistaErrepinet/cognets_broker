@@ -1,3 +1,9 @@
+//! Cognets broker library crate.
+//!
+//! Modules are split by concern: HTTP wiring in `api`, shared state in `app`,
+//! request parsing in `context` and `query`, storage adapters in
+//! `persistence`, domain shapes in `domain`, business logic in `services`, and
+//! small helpers in `utils`.
 pub mod api;
 pub mod app;
 pub mod config;

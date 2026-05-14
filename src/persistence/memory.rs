@@ -1,3 +1,4 @@
+//! In-memory repository implementations used mainly by tests.
 use std::{
     collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
@@ -13,7 +14,7 @@ use crate::{
         EntityRepository, Repositories, SubscriptionRepository, TemporalRepository,
         filter_entity_documents, filter_temporal_documents, update_status_field,
     },
-    query::planner::{GeoFilter, MongoQueryPlan, TemporalFilter},
+    query::planner::{GeoFilter, QueryPlan, TemporalFilter},
 };
 
 type Key = (String, String);
@@ -27,6 +28,7 @@ pub fn repositories() -> Repositories {
     )
 }
 
+/// In-memory entity repository keyed by `(tenant, entity_id)`.
 #[derive(Default)]
 pub struct MemoryEntityRepository {
     documents: Mutex<HashMap<Key, StoredDocument>>,
@@ -83,7 +85,7 @@ impl EntityRepository for MemoryEntityRepository {
     async fn query(
         &self,
         tenant: &str,
-        plan: &MongoQueryPlan,
+        plan: &QueryPlan,
     ) -> Result<Vec<StoredDocument>, BrokerError> {
         let documents = self
             .documents
@@ -109,6 +111,7 @@ impl EntityRepository for MemoryEntityRepository {
     }
 }
 
+/// In-memory temporal repository keyed by `(tenant, entity_id)`.
 #[derive(Default)]
 pub struct MemoryTemporalRepository {
     documents: Mutex<HashMap<Key, TemporalEntityDocument>>,
@@ -149,7 +152,7 @@ impl TemporalRepository for MemoryTemporalRepository {
     async fn query(
         &self,
         tenant: &str,
-        plan: &MongoQueryPlan,
+        plan: &QueryPlan,
         _temporal: &TemporalFilter,
         _geo: Option<&GeoFilter>,
     ) -> Result<Vec<TemporalEntityDocument>, BrokerError> {
@@ -165,6 +168,7 @@ impl TemporalRepository for MemoryTemporalRepository {
     }
 }
 
+/// In-memory subscription repository keyed by `(tenant, subscription_id)`.
 #[derive(Default)]
 pub struct MemorySubscriptionRepository {
     documents: Mutex<HashMap<Key, SubscriptionDocument>>,

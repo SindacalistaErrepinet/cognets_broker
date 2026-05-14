@@ -1,3 +1,8 @@
+//! Temporal entity services.
+//!
+//! This module stores current temporal snapshots plus append-only history, then
+//! renders snapshot or history-oriented views based on temporal query
+//! parameters.
 use std::{collections::HashMap, sync::Arc};
 
 use serde_json::{Map, Value};
@@ -12,7 +17,7 @@ use crate::{
     error::BrokerError,
     query::{
         context::resolve_context_terms,
-        planner::{MongoQueryPlan, TemporalFilter},
+        planner::{QueryPlan, TemporalFilter},
         types::{Representation, TemporalEntityQuery},
     },
     services::common::{
@@ -23,7 +28,11 @@ use crate::{
     utils::{json::editable_fragment_members, time::now_timestamp},
 };
 
-/// Creates or updates temporal entity.
+/// Creates or updates temporal entity for current tenant.
+///
+/// Current entity payload becomes latest snapshot, while helper-generated
+/// history entries are extracted from top-level attributes and stored alongside
+/// snapshot for later temporal queries.
 pub async fn upsert(
     state: &AppState,
     context: &RequestContext,
@@ -46,14 +55,18 @@ pub async fn upsert(
     Ok((entity_id, created))
 }
 
-/// Queries temporal entities and formats history projection.
+/// Queries temporal entities and formats requested history projection.
+///
+/// Storage-side query plan narrows candidate snapshots first. Then service runs
+/// context-aware `q` evaluation, selects matching history records for requested
+/// temporal window, and renders them into chosen representation.
 pub async fn query(
     state: &AppState,
     context: &RequestContext,
     request: &actix_web::HttpRequest,
     query: &TemporalEntityQuery,
 ) -> Result<TemporalQueryResult, BrokerError> {
-    let plan = MongoQueryPlan::from_entity_query(&query.entity)?;
+    let plan = QueryPlan::from_entity_query(&query.entity)?;
     let temporal = TemporalFilter::from_query(query)?;
     let representation = representation_from_request(
         request,
@@ -134,6 +147,9 @@ pub async fn get(
 }
 
 /// Returns all temporal attributes for one entity.
+///
+/// Response strips reserved entity metadata members and keeps only attribute
+/// history payloads.
 pub async fn get_attrs(
     state: &AppState,
     context: &RequestContext,
@@ -215,7 +231,7 @@ pub async fn get_attr_instance(
         })
 }
 
-/// Deletes temporal entity and records deletion mutation.
+/// Deletes temporal entity snapshot and its stored history.
 pub async fn delete_entity(
     state: &AppState,
     context: &RequestContext,
@@ -236,7 +252,7 @@ pub async fn delete_entity(
     Ok(())
 }
 
-/// Appends temporal attributes and updates history.
+/// Appends temporal attributes and records new history instances.
 pub async fn append_attrs(
     state: &AppState,
     context: &RequestContext,
@@ -270,7 +286,7 @@ pub async fn append_attrs(
     Ok(())
 }
 
-/// Deletes all instances for one temporal attribute.
+/// Deletes all stored instances for one temporal attribute.
 pub async fn delete_attr(
     state: &AppState,
     context: &RequestContext,
@@ -301,7 +317,7 @@ pub async fn delete_attr(
     Ok(())
 }
 
-/// Patches one temporal attribute instance.
+/// Patches one temporal attribute instance in stored history.
 pub async fn patch_instance(
     state: &AppState,
     context: &RequestContext,
@@ -621,7 +637,7 @@ async fn temporal_query_linked_graph(
         .temporals
         .query(
             &context.tenant,
-            &MongoQueryPlan::default(),
+            &QueryPlan::default(),
             &TemporalFilter::from_query(query)?,
             None,
         )

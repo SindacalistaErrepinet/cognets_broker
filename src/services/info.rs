@@ -1,3 +1,4 @@
+//! Broker information endpoints.
 use url::Url;
 
 use crate::{

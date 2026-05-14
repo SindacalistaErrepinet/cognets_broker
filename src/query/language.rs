@@ -1,3 +1,8 @@
+//! NGSI-LD `q` and `scopeQ` parser and evaluator.
+//!
+//! Parser builds expression trees from request strings. Evaluator then resolves
+//! entity attributes, optional linked-entity traversals, and context-expanded
+//! values against those trees.
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -8,72 +13,116 @@ use serde_json::Value;
 
 use crate::error::BrokerError;
 
+/// Parsed attribute selector used inside `q` expressions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryAttribute {
+    /// Direct lookup on current entity payload.
     ValuePath {
+        /// Dotted attribute path segments.
         segments: Vec<String>,
+        /// Optional post-processing traversal such as nested members or all
+        /// language entries.
         trailing_path: Option<TrailingPath>,
     },
+    /// Relationship traversal into linked entity graph.
     LinkedEntity {
+        /// Relationship attribute used to find target ids.
         relation: String,
+        /// Optional target entity type filter.
         entity_types: Vec<String>,
+        /// Attribute selector applied to linked target entity.
         attribute: Box<QueryAttribute>,
     },
 }
 
+/// Extra traversal after initial attribute extraction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrailingPath {
+    /// Traverse nested members explicitly.
     Members(Vec<String>),
+    /// Expand all values stored in language map.
     AnyLanguage,
 }
 
+/// Right-hand operand for equality-style operators.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EqualityOperand {
+    /// One expected value.
     Single(Value),
+    /// Set-membership match.
     List(Vec<Value>),
+    /// Inclusive range bounds.
     Range(Value, Value),
 }
 
+/// Parsed `q` expression tree.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QExpression {
+    /// Attribute existence check.
     Exists(QueryAttribute),
+    /// Equality or list/range match.
     Eq(QueryAttribute, EqualityOperand),
+    /// Negated equality or membership match.
     Neq(QueryAttribute, EqualityOperand),
+    /// Greater-than comparison.
     Gt(QueryAttribute, Value),
+    /// Greater-than-or-equal comparison.
     Gte(QueryAttribute, Value),
+    /// Less-than comparison.
     Lt(QueryAttribute, Value),
+    /// Less-than-or-equal comparison.
     Lte(QueryAttribute, Value),
+    /// Regex match.
     Pattern(QueryAttribute, String),
+    /// Negated regex match.
     NotPattern(QueryAttribute, String),
+    /// Conjunction of child expressions.
     And(Vec<QExpression>),
+    /// Disjunction of child expressions.
     Or(Vec<QExpression>),
 }
 
+/// Parsed `scopeQ` expression tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeExpression {
+    /// Match any non-empty scope value.
     AnyNonEmpty,
+    /// Match one concrete scope pattern.
     Pattern(ScopePattern),
+    /// All listed patterns must match at least one scope each.
     And(Vec<ScopePattern>),
+    /// Any child expression may match.
     Or(Vec<ScopeExpression>),
 }
 
+/// Concrete scope pattern broken into levels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopePattern {
+    /// Ordered scope levels in pattern.
     pub levels: Vec<ScopeLevel>,
+    /// Whether descendants beyond listed levels should match.
     pub include_descendants: bool,
 }
 
+/// One scope segment matcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeLevel {
+    /// Exact segment value.
     Exact(String),
+    /// Wildcard matching exactly one segment.
     SingleLevelWildcard,
 }
 
+/// Extra knobs used while evaluating parsed queries.
 #[derive(Debug, Clone, Default)]
 pub struct QueryMatchOptions {
+    /// Attribute ids whose values should be expanded through context aliases.
     pub expand_values: HashSet<String>,
+    /// JSON keys that stay visible when traversing arbitrary JSON members.
     pub json_keys: HashSet<String>,
+    /// Compact-term to expanded-IRI mapping from JSON-LD contexts.
     pub context_terms: HashMap<String, String>,
+    /// Linked entity cache keyed by entity id for relationship traversal.
     pub linked_entities: Arc<HashMap<String, Value>>,
 }
 

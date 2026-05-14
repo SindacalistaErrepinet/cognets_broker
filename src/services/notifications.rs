@@ -1,3 +1,8 @@
+//! Subscription matching and delivery.
+//!
+//! Notification delivery happens inline on write paths. This module loads local
+//! subscriptions, evaluates entity and query predicates, builds NGSI-LD
+//! notification payloads, and records delivery accounting.
 use std::{collections::HashMap, sync::Arc};
 
 use log::warn;
@@ -238,7 +243,7 @@ async fn entity_graph(
     let mut entities = state
         .repositories
         .entities
-        .query(tenant, &crate::query::planner::MongoQueryPlan::default())
+        .query(tenant, &crate::query::planner::QueryPlan::default())
         .await?
         .into_iter()
         .map(|document| document.doc)

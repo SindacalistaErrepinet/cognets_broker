@@ -1,3 +1,4 @@
+//! Subscription CRUD services.
 use serde_json::Value;
 
 use crate::{

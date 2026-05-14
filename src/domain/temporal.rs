@@ -1,7 +1,9 @@
+//! Temporal query input and output payloads.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 
+/// Shared temporal query parameters accepted by API endpoints.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TemporalQueryInput {
     #[serde(rename = "timerel")]
@@ -22,8 +24,11 @@ pub struct TemporalQueryInput {
     pub format: Option<String>,
 }
 
+/// Temporal query result returned by service layer.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TemporalQueryResult {
+    /// JSON response payload.
     pub body: Value,
+    /// Count before HTTP-layer pagination headers are applied.
     pub total_count: usize,
 }

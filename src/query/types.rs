@@ -1,16 +1,24 @@
+//! Shared query parameter and result shapes.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};
 
+/// Response shape requested by client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Representation {
+    /// Full normalized NGSI-LD representation.
     Normalized,
+    /// Simplified key-values representation.
     KeyValues,
+    /// GeoJSON feature or feature collection representation.
     GeoJson,
+    /// Temporal history list representation.
     TemporalValues,
+    /// Aggregated temporal history representation.
     AggregatedValues,
 }
 
+/// Common entity query parameters accepted by collection endpoints.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, IntoParams, ToSchema)]
 #[into_params(parameter_in = Query)]
 pub struct EntityQuery {
@@ -53,6 +61,7 @@ pub struct EntityQuery {
     pub local: Option<bool>,
 }
 
+/// Query parameters that only select an entity type and local scope.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, IntoParams, ToSchema)]
 #[into_params(parameter_in = Query)]
 pub struct EntityTypeQuery {
@@ -61,12 +70,14 @@ pub struct EntityTypeQuery {
     pub local: Option<bool>,
 }
 
+/// Query parameters that only toggle local-only execution.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, IntoParams, ToSchema)]
 #[into_params(parameter_in = Query)]
 pub struct LocalOnlyQuery {
     pub local: Option<bool>,
 }
 
+/// Query parameters for append-attributes endpoint.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, IntoParams, ToSchema)]
 #[into_params(parameter_in = Query)]
 pub struct AppendAttrsQuery {
@@ -76,6 +87,7 @@ pub struct AppendAttrsQuery {
     pub local: Option<bool>,
 }
 
+/// Query parameters for delete-attribute endpoint.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, IntoParams, ToSchema)]
 #[into_params(parameter_in = Query)]
 pub struct DeleteAttrQuery {
@@ -88,6 +100,7 @@ pub struct DeleteAttrQuery {
     pub local: Option<bool>,
 }
 
+/// Query parameters for batch upsert endpoint.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, IntoParams, ToSchema)]
 #[into_params(parameter_in = Query)]
 pub struct UpsertBatchQuery {
@@ -95,6 +108,7 @@ pub struct UpsertBatchQuery {
     pub local: Option<bool>,
 }
 
+/// Query parameters for batch partial-update endpoint.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, IntoParams, ToSchema)]
 #[into_params(parameter_in = Query)]
 pub struct BatchUpdateQuery {
@@ -102,6 +116,7 @@ pub struct BatchUpdateQuery {
     pub local: Option<bool>,
 }
 
+/// Query parameters for subscription listing endpoint.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, IntoParams, ToSchema)]
 #[into_params(parameter_in = Query)]
 pub struct SubscriptionQuery {
@@ -110,6 +125,7 @@ pub struct SubscriptionQuery {
     pub local: Option<bool>,
 }
 
+/// Query parameters for discovery endpoints.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, IntoParams, ToSchema)]
 #[into_params(parameter_in = Query)]
 pub struct DiscoveryQuery {
@@ -117,6 +133,7 @@ pub struct DiscoveryQuery {
     pub local: Option<bool>,
 }
 
+/// Temporal query parameters layered on top of common entity query fields.
 #[derive(Debug, Default, Clone, Deserialize, Serialize, ToSchema)]
 pub struct TemporalEntityQuery {
     #[serde(flatten)]
@@ -137,12 +154,14 @@ pub struct TemporalEntityQuery {
     pub aggr_period_duration: Option<String>,
 }
 
+/// Service-layer query result with rendered body and pre-header total count.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct QueryResult {
     pub body: Value,
     pub total_count: usize,
 }
 
+/// Path parameters for entity-id routes.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Path)]
 pub struct EntityIdPath {
@@ -150,6 +169,7 @@ pub struct EntityIdPath {
     pub entity_id: String,
 }
 
+/// Path parameters for entity-attribute routes.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Path)]
 pub struct EntityAttrPath {
@@ -159,6 +179,7 @@ pub struct EntityAttrPath {
     pub attr_id: String,
 }
 
+/// Path parameters for temporal attribute instance routes.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Path)]
 pub struct EntityAttrInstancePath {
@@ -170,6 +191,7 @@ pub struct EntityAttrInstancePath {
     pub instance_id: String,
 }
 
+/// Path parameters for subscription-id routes.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Path)]
 pub struct SubscriptionIdPath {
@@ -177,6 +199,7 @@ pub struct SubscriptionIdPath {
     pub subscription_id: String,
 }
 
+/// Path parameters for entity-type discovery routes.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Path)]
 pub struct TypeNamePath {
@@ -184,6 +207,7 @@ pub struct TypeNamePath {
     pub type_name: String,
 }
 
+/// Path parameters for attribute discovery routes.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Path)]
 pub struct AttributeNamePath {
@@ -191,6 +215,7 @@ pub struct AttributeNamePath {
     pub attribute_name: String,
 }
 
+/// OpenAPI-friendly temporal query wrapper for GET endpoints.
 #[derive(Debug, Default, Clone, Deserialize, IntoParams, ToSchema)]
 #[into_params(parameter_in = Query)]
 pub struct TemporalEntityQueryParams {

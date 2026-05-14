@@ -1,3 +1,4 @@
+//! Shared application state passed to HTTP handlers and services.
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -7,12 +8,18 @@ use crate::{
     persistence::repository::Repositories,
 };
 
+/// Shared runtime state for request handling and background work.
 #[derive(Clone)]
 pub struct AppState {
+    /// Static configuration derived from environment variables.
     pub config: AppConfig,
+    /// Storage adapters used by services.
     pub repositories: Repositories,
+    /// Outbound HTTP client for context resolution and notifications.
     pub http_client: Client,
+    /// Process start timestamp used for uptime reporting.
     pub started_at: Instant,
+    /// Duplicate-suppression state for entity watch worker.
     pub entity_watch: EntityWatchState,
 }
 

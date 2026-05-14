@@ -1,3 +1,4 @@
+//! Entity-type and attribute discovery services.
 use std::collections::{BTreeMap, BTreeSet};
 
 use actix_web::HttpRequest;
@@ -8,24 +9,27 @@ use crate::{
     context::headers::RequestContext,
     domain::discovery::{AttributeInfo, AttributeList, EntityTypeInfo, EntityTypeList},
     error::BrokerError,
-    query::planner::MongoQueryPlan,
+    query::planner::QueryPlan,
     services::common::entity_primary_type,
     utils::json::entity_attribute_names,
 };
 
 #[derive(Default)]
+/// Aggregated discovery state built from current entity set.
 struct DiscoveryAccumulator {
     by_type: BTreeMap<String, TypeAggregate>,
     by_attribute: BTreeMap<String, AttributeAggregate>,
 }
 
 #[derive(Default, Clone)]
+/// Per-entity-type aggregate used while building discovery payloads.
 struct TypeAggregate {
     count: u64,
     attributes: BTreeMap<String, AttributeAggregate>,
 }
 
 #[derive(Default, Clone)]
+/// Per-attribute aggregate used while building discovery payloads.
 struct AttributeAggregate {
     count: u64,
     attribute_types: BTreeSet<String>,
@@ -140,7 +144,7 @@ async fn discovery_entities(
     context: &RequestContext,
     _local_only: bool,
 ) -> Result<Vec<Value>, BrokerError> {
-    let plan = MongoQueryPlan::default();
+    let plan = QueryPlan::default();
     let items = state
         .repositories
         .entities
