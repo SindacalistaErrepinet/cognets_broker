@@ -1,5 +1,6 @@
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Lock
 from urllib.parse import parse_qs, urlparse
@@ -74,6 +75,7 @@ class Handler(BaseHTTPRequestHandler):
             MESSAGES.append(
                 {
                     "channel": channel,
+                    "receivedAtEpochMs": time.time_ns() // 1_000_000,
                     "headers": dict(self.headers.items()),
                     "body": json.loads(raw_body),
                 }

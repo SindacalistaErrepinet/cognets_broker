@@ -194,6 +194,8 @@ Swarm test details:
 - DefraDB P2P is enabled only for `EntityRecord`; `SubscriptionRecord` is never added to pubsub or replicators
 - verifies create from `broker1`, update from `broker5`, and delete from `broker9`
 - asserts every broker observes replicated entity state and emits one local notification for each lifecycle step
+- measures per-node data propagation time and compares it with notification receipt time for create, update, and delete
+- runs concurrent inserts from all 10 brokers and validates both final consistency and propagation/notification latency distributions
 - uses existing host `target/debug/cognets_broker` binary and builds it automatically if missing
 - set `KEEP_SWARM=1` to inspect running containers after the script exits
 
