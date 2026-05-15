@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::{
     app::state::AppState,
     context::headers::HEADER_TENANT,
-    domain::types::{EntityEvent, EntityEventKind},
+    domain::types::{EntityEvent, EntityEventKind, SubscriptionDocument},
     error::BrokerError,
     query::{
         context::resolve_context_terms,
@@ -25,6 +25,8 @@ use crate::{
     utils::time::now_timestamp,
 };
 
+type DeliveryCounts = HashMap<String, (u64, u64)>;
+
 /// Matches local subscriptions and delivers notifications inline.
 pub async fn enqueue_notifications(
     state: &AppState,
@@ -33,6 +35,58 @@ pub async fn enqueue_notifications(
     event: &EntityEvent,
 ) -> Result<(), BrokerError> {
     let subscriptions = state.repositories.subscriptions.list(tenant, None).await?;
+    let attempted_at = now_timestamp();
+    let mut delivery_counts = HashMap::new();
+    deliver_notifications(
+        state,
+        tenant,
+        &subscriptions,
+        entity,
+        event,
+        &mut delivery_counts,
+    )
+    .await?;
+    record_delivery_counts(state, tenant, delivery_counts, &attempted_at).await;
+    Ok(())
+}
+
+/// Matches and delivers notifications for many entity events with one subscription scan.
+pub async fn enqueue_notifications_batch(
+    state: &AppState,
+    tenant: &str,
+    events: &[(Value, EntityEvent)],
+) -> Result<(), BrokerError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let subscriptions = state.repositories.subscriptions.list(tenant, None).await?;
+    let attempted_at = now_timestamp();
+    let mut delivery_counts = HashMap::new();
+    for (entity, event) in events {
+        deliver_notifications(
+            state,
+            tenant,
+            &subscriptions,
+            entity,
+            event,
+            &mut delivery_counts,
+        )
+        .await?;
+    }
+    record_delivery_counts(state, tenant, delivery_counts, &attempted_at).await;
+    Ok(())
+}
+
+/// Delivers notifications against caller-provided subscription snapshot.
+async fn deliver_notifications(
+    state: &AppState,
+    tenant: &str,
+    subscriptions: &[SubscriptionDocument],
+    entity: &Value,
+    event: &EntityEvent,
+    delivery_counts: &mut DeliveryCounts,
+) -> Result<(), BrokerError> {
     let linked_entities = if subscriptions
         .iter()
         .any(|subscription| subscription_uses_linked_graph(&subscription.doc))
@@ -79,15 +133,13 @@ pub async fn enqueue_notifications(
             .as_ref()
             .map(|response| response.status().is_success())
             .unwrap_or(false);
-        let attempted_at = now_timestamp();
-
-        if let Err(error) = state
-            .repositories
-            .subscriptions
-            .mark_delivery(tenant, subscription_id, success, &attempted_at)
-            .await
-        {
-            warn!("failed updating notification delivery state for {subscription_id}: {error}");
+        let entry = delivery_counts
+            .entry(subscription_id.to_string())
+            .or_insert((0_u64, 0_u64));
+        if success {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
         }
 
         match response {
@@ -105,6 +157,25 @@ pub async fn enqueue_notifications(
     }
 
     Ok(())
+}
+
+/// Persists coalesced delivery accounting after notification HTTP work completes.
+async fn record_delivery_counts(
+    state: &AppState,
+    tenant: &str,
+    delivery_counts: DeliveryCounts,
+    attempted_at: &str,
+) {
+    for (subscription_id, (successes, failures)) in delivery_counts {
+        if let Err(error) = state
+            .repositories
+            .subscriptions
+            .mark_delivery_batch(tenant, &subscription_id, successes, failures, &attempted_at)
+            .await
+        {
+            warn!("failed updating notification delivery state for {subscription_id}: {error}");
+        }
+    }
 }
 
 /// Evaluates whether entity event matches subscription filters.

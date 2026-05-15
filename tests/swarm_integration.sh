@@ -550,7 +550,7 @@ concurrent_delete_request() {
   entity_id="$(concurrent_entity_id "$owner_index")"
   encoded_id="$(urlencode "$entity_id")"
 
-  curl -fsS \
+  curl --fail-with-body -sS \
     -X DELETE \
     "$(broker_url "$owner_index")/entities/$encoded_id" \
     -o /dev/null
@@ -639,13 +639,11 @@ measure_concurrent_read_latencies() {
         key="entity${owner_index}.node${index}"
         [[ -n "${CONCURRENT_READ_LATENCY_MS[$key]:-}" ]] && continue
         if [[ "$state" == "deleted" ]]; then
-          entity_state_matches "$entity_id" "$index" deleted
+          entity_state_matches "$entity_id" "$index" deleted || continue
         else
-          entity_state_matches "$entity_id" "$index" present "$speed"
+          entity_state_matches "$entity_id" "$index" present "$speed" || continue
         fi
-        if [[ $? -eq 0 ]]; then
-          CONCURRENT_READ_LATENCY_MS[$key]=$((now - start_ms))
-        fi
+        CONCURRENT_READ_LATENCY_MS[$key]=$((now - start_ms))
       done
     done
 
@@ -798,13 +796,15 @@ load_insert_batch() {
   local broker_index=$1
   local start_index=$2
   local count=$3
+  local body_file
   local payload
+  local status_code
 
   payload="$(jq -nc \
     --argjson start_index "$start_index" \
     --argjson count "$count" \
     '[range(0; $count) | {
-      id: ("urn:ngsi-ld:Vehicle:swarm-load-" + ((($start_index + .) | tostring) | lpad(5; "0"))),
+      id: ("urn:ngsi-ld:Vehicle:swarm-load-" + ("00000" + (($start_index + .) | tostring))[-5:]),
       type: "Vehicle",
       speed: {
         type: "Property",
@@ -812,12 +812,24 @@ load_insert_batch() {
       }
     }]')"
 
-  curl -fsS \
+  body_file="$(mktemp)"
+  status_code="$(curl -sS \
     -X POST \
     -H 'Content-Type: application/json' \
     -d "$payload" \
     "$(broker_url "$broker_index")/entityOperations/create" \
-    -o /dev/null
+    -o "$body_file" \
+    -w '%{http_code}')" || {
+    printf 'bulk insert broker%s curl failed: %s\n' "$broker_index" "$(<"$body_file")" >&2
+    rm -f "$body_file"
+    return 1
+  }
+  if [[ "$status_code" != "201" ]]; then
+    printf 'bulk insert broker%s returned HTTP %s: %s\n' "$broker_index" "$status_code" "$(<"$body_file")" >&2
+    rm -f "$body_file"
+    return 1
+  fi
+  rm -f "$body_file"
 }
 
 all_brokers_report_load_count() {
@@ -825,11 +837,22 @@ all_brokers_report_load_count() {
   local index
 
   for index in $(seq 1 "$BROKER_COUNT"); do
-    count="$(curl -fsSI "$(broker_url "$index")/entities?type=Vehicle&count=true&limit=1" | tr -d '\r' | awk -F': ' '/^NGSILD-Results-Count:/ {print $2}')"
+    count="$(curl -fsS -D - -o /dev/null "$(broker_url "$index")/entities?type=Vehicle&count=true&limit=1" | tr -d '\r' | awk -F': ' 'tolower($1) == "ngsild-results-count" {print $2}')"
     [[ "$count" == "$expected_count" ]] || return 1
   done
 
   return 0
+}
+
+print_load_counts() {
+  local index
+  local count
+
+  printf 'Current load counts by broker:\n' >&2
+  for index in $(seq 1 "$BROKER_COUNT"); do
+    count="$(curl -fsS -D - -o /dev/null "$(broker_url "$index")/entities?type=Vehicle&count=true&limit=1" | tr -d '\r' | awk -F': ' 'tolower($1) == "ngsild-results-count" {print $2}')" || count="curl failed"
+    printf '  broker%s: %s\n' "$index" "${count:-missing}" >&2
+  done
 }
 
 load_entities_probe_visible_everywhere() {
@@ -837,8 +860,12 @@ load_entities_probe_visible_everywhere() {
   local probe_index
   local entity_id
   local speed
+  local probes
 
-  for probe_index in 1 2500 5000; do
+  probes="$(jq -nc \
+    --argjson total "$LOAD_TEST_INSERT_COUNT" \
+    '[1, (($total + 1) / 2 | floor), $total] | map(select(. >= 1 and . <= $total)) | unique[]')"
+  for probe_index in $probes; do
     entity_id="$(load_entity_id "$probe_index")"
     speed="$(load_entity_speed "$probe_index")"
     for index in $(seq 1 "$BROKER_COUNT"); do
@@ -876,11 +903,14 @@ run_bulk_insert_phase() {
     wait "$pid"
   done
 
-  wait_until '5000 insert count replication' $((LOAD_PROPAGATION_BUDGET_MS / 1000)) all_brokers_report_load_count "$LOAD_TEST_INSERT_COUNT"
-  wait_until '5000 insert probe replication' $((LOAD_PROPAGATION_BUDGET_MS / 1000)) load_entities_probe_visible_everywhere
+  if ! wait_until "$LOAD_TEST_INSERT_COUNT insert count replication" $((LOAD_PROPAGATION_BUDGET_MS / 1000)) all_brokers_report_load_count "$LOAD_TEST_INSERT_COUNT"; then
+    print_load_counts
+    return 1
+  fi
+  wait_until "$LOAD_TEST_INSERT_COUNT insert probe replication" $((LOAD_PROPAGATION_BUDGET_MS / 1000)) load_entities_probe_visible_everywhere
   end_ms="$(now_ms)"
-  record_metric 'bulk_insert_5000' total_duration load all all "$((end_ms - start_ms))"
-  printf 'bulk insert 5000 total duration=%sms\n' "$((end_ms - start_ms))"
+  record_metric 'bulk_insert' total_duration load all all "$((end_ms - start_ms))"
+  printf 'bulk insert %s total duration=%sms\n' "$LOAD_TEST_INSERT_COUNT" "$((end_ms - start_ms))"
 }
 
 subscription_locality_holds() {
@@ -1003,10 +1033,8 @@ delete_entity() {
 }
 
 printf 'Starting 10-node swarm stack\n'
-if [[ ! -x "$ROOT_DIR/target/debug/cognets_broker" ]]; then
-  printf 'Building broker binary on host\n'
-  cargo build >/dev/null
-fi
+printf 'Building broker binary on host\n'
+cargo build >/dev/null
 
 reset_metric_artifacts
 
@@ -1057,7 +1085,7 @@ run_concurrent_delete_phase
 wait_until 'subscriptions remain local after concurrent deletes' 20 subscriptions_remain_local
 
 run_bulk_insert_phase
-wait_until 'subscriptions remain local after 5000 inserts' 20 subscriptions_remain_local
+wait_until "subscriptions remain local after $LOAD_TEST_INSERT_COUNT inserts" 20 subscriptions_remain_local
 
 printf 'metric artifacts: %s %s\n' "$METRIC_JSON_PATH" "$METRIC_CSV_PATH"
 

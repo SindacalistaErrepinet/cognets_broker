@@ -86,7 +86,7 @@ impl QueryPlan {
                 query.coordinates.as_deref(),
                 query.geoproperty.as_deref(),
             )?,
-            limit: if query.q.is_some() || query.scope_q.is_some() {
+            limit: if query.q.is_some() || query.scope_q.is_some() || query.count.unwrap_or(false) {
                 None
             } else {
                 query.limit
@@ -366,6 +366,21 @@ mod tests {
         assert!(plan.q_expression.is_some());
         assert_eq!(plan.limit, None);
 
+        Ok(())
+    }
+
+    #[test]
+    fn count_queries_do_not_push_limit_into_storage() -> Result<(), BrokerError> {
+        let query = EntityQuery {
+            entity_type: Some("Vehicle".to_string()),
+            limit: Some(1),
+            count: Some(true),
+            ..Default::default()
+        };
+
+        let plan = QueryPlan::from_entity_query(&query)?;
+
+        assert_eq!(plan.limit, None);
         Ok(())
     }
 

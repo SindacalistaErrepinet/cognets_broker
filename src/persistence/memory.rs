@@ -5,14 +5,16 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use crate::{
-    domain::types::{StoredDocument, SubscriptionDocument, TemporalEntityDocument},
+    domain::types::{
+        EntityMutationDocument, StoredDocument, SubscriptionDocument, TemporalEntityDocument,
+    },
     error::BrokerError,
     persistence::repository::{
-        EntityRepository, Repositories, SubscriptionRepository, TemporalRepository,
-        filter_entity_documents, filter_temporal_documents, update_status_field,
+        EntityMutationRepository, EntityRepository, Repositories, SubscriptionRepository,
+        TemporalRepository, filter_entity_documents, filter_temporal_documents,
+        update_delivery_fields,
     },
     query::planner::{GeoFilter, QueryPlan, TemporalFilter},
 };
@@ -25,6 +27,7 @@ pub fn repositories() -> Repositories {
         Arc::new(MemoryEntityRepository::default()),
         Arc::new(MemoryTemporalRepository::default()),
         Arc::new(MemorySubscriptionRepository::default()),
+        Arc::new(MemoryEntityMutationRepository::default()),
     )
 }
 
@@ -59,6 +62,23 @@ impl EntityRepository for MemoryEntityRepository {
             )));
         }
         documents.insert(key, document);
+        Ok(())
+    }
+
+    async fn insert_many(&self, new_documents: Vec<StoredDocument>) -> Result<(), BrokerError> {
+        let mut documents = self.documents.lock().unwrap();
+        for document in &new_documents {
+            let key = key(&document.tenant, &document.ngsi_id);
+            if documents.contains_key(&key) {
+                return Err(BrokerError::Conflict(format!(
+                    "entity {} already exists",
+                    document.ngsi_id
+                )));
+            }
+        }
+        for document in new_documents {
+            documents.insert(key(&document.tenant, &document.ngsi_id), document);
+        }
         Ok(())
     }
 
@@ -260,51 +280,77 @@ impl SubscriptionRepository for MemorySubscriptionRepository {
         success: bool,
         now: &str,
     ) -> Result<(), BrokerError> {
+        self.mark_delivery_batch(
+            tenant,
+            subscription_id,
+            u64::from(success),
+            u64::from(!success),
+            now,
+        )
+        .await
+    }
+
+    async fn mark_delivery_batch(
+        &self,
+        tenant: &str,
+        subscription_id: &str,
+        successes: u64,
+        failures: u64,
+        now: &str,
+    ) -> Result<(), BrokerError> {
         let key = (tenant.to_string(), subscription_id.to_string());
         let mut documents = self.documents.lock().unwrap();
         let Some(subscription) = documents.get_mut(&key) else {
             return Ok(());
         };
 
-        if let Some(notification) = subscription
-            .doc
-            .get_mut("notification")
-            .and_then(Value::as_object_mut)
-        {
-            let sent = notification
-                .get("timesSent")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                + 1;
-            notification.insert("timesSent".to_string(), Value::from(sent));
-            notification.insert(
-                "status".to_string(),
-                Value::String(if success { "ok" } else { "failed" }.to_string()),
-            );
-            notification.insert(
-                "lastNotification".to_string(),
-                Value::String(now.to_string()),
-            );
-
-            if success {
-                notification.insert("lastSuccess".to_string(), Value::String(now.to_string()));
-            } else {
-                let failed = notification
-                    .get("timesFailed")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    + 1;
-                notification.insert("timesFailed".to_string(), Value::from(failed));
-                notification.insert("lastFailure".to_string(), Value::String(now.to_string()));
-            }
-        }
-
-        update_status_field(
-            &mut subscription.doc,
-            "modifiedAt",
-            Value::String(now.to_string()),
-        );
+        update_delivery_fields(&mut subscription.doc, successes, failures, now);
         Ok(())
+    }
+}
+
+/// In-memory mutation-log repository keyed by event id.
+#[derive(Default)]
+pub struct MemoryEntityMutationRepository {
+    documents: Mutex<HashMap<String, EntityMutationDocument>>,
+}
+
+#[async_trait]
+impl EntityMutationRepository for MemoryEntityMutationRepository {
+    async fn insert(&self, document: EntityMutationDocument) -> Result<(), BrokerError> {
+        self.documents
+            .lock()
+            .unwrap()
+            .insert(document.event_id.clone(), document);
+        Ok(())
+    }
+
+    async fn insert_many(&self, documents: Vec<EntityMutationDocument>) -> Result<(), BrokerError> {
+        let mut stored = self.documents.lock().unwrap();
+        for document in documents {
+            stored.insert(document.event_id.clone(), document);
+        }
+        Ok(())
+    }
+
+    async fn list_after(
+        &self,
+        created_after_millis: i64,
+    ) -> Result<Vec<EntityMutationDocument>, BrokerError> {
+        let mut documents = self
+            .documents
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|document| document.created_at_millis >= created_after_millis)
+            .cloned()
+            .collect::<Vec<_>>();
+        documents.sort_by(|left, right| {
+            left.created_at_millis
+                .cmp(&right.created_at_millis)
+                .then_with(|| left.event_id.cmp(&right.event_id))
+        });
+        Ok(documents)
     }
 }
 

@@ -14,6 +14,7 @@ done
 ENTITY_SCHEMA='type EntityRecord { tenant: String, ngsiId: String, payload: String }'
 TEMPORAL_SCHEMA='type TemporalRecord { tenant: String, ngsiId: String, payload: String, historyJson: String }'
 SUBSCRIPTION_SCHEMA='type SubscriptionRecord { tenant: String, ngsiId: String, payload: String }'
+ENTITY_MUTATION_SCHEMA='type EntityMutationRecord { tenant: String, eventId: String, entityId: String, operation: String, payload: String, changedAttributesJson: String, originBrokerId: String, createdAtMillis: Float }'
 
 compose_exec() {
   local service=$1
@@ -78,6 +79,7 @@ for service in "${DEFRA_SERVICES[@]}"; do
   ensure_collection "$service" EntityRecord "$ENTITY_SCHEMA"
   ensure_collection "$service" TemporalRecord "$TEMPORAL_SCHEMA"
   ensure_collection "$service" SubscriptionRecord "$SUBSCRIPTION_SCHEMA"
+  ensure_collection "$service" EntityMutationRecord "$ENTITY_MUTATION_SCHEMA"
 done
 
 declare -A PEER_ADDRS
@@ -96,12 +98,13 @@ for service in "${DEFRA_SERVICES[@]}"; do
   retry 20 compose_exec "$service" /defradb client p2p connect --url 127.0.0.1:9181 "${addresses[@]}" >/dev/null
 done
 
-printf 'Enabling EntityRecord pubsub synchronization only\n'
+printf 'Enabling replicated entity data and mutation-log pubsub synchronization only\n'
 for service in "${DEFRA_SERVICES[@]}"; do
   retry 10 compose_exec "$service" /defradb client p2p collection add --url 127.0.0.1:9181 EntityRecord >/dev/null
+  retry 10 compose_exec "$service" /defradb client p2p collection add --url 127.0.0.1:9181 EntityMutationRecord >/dev/null
 done
 
-printf 'Adding EntityRecord replicators only\n'
+printf 'Adding replicated entity data and mutation-log replicators only\n'
 for service in "${DEFRA_SERVICES[@]}"; do
   addresses=()
   for peer in "${DEFRA_SERVICES[@]}"; do
@@ -110,6 +113,7 @@ for service in "${DEFRA_SERVICES[@]}"; do
     fi
   done
   retry 10 compose_exec "$service" /defradb client p2p replicator add --url 127.0.0.1:9181 -c EntityRecord "${addresses[@]}" >/dev/null
+  retry 10 compose_exec "$service" /defradb client p2p replicator add --url 127.0.0.1:9181 -c EntityMutationRecord "${addresses[@]}" >/dev/null
 done
 
 printf 'DefraDB swarm bootstrap complete\n'

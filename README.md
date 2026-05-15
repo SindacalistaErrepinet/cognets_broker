@@ -7,6 +7,7 @@ Current runtime pieces:
 - `actix-web` for HTTP API
 - DefraDB GraphQL endpoint for persisted entities, temporal entities, and subscriptions
 - direct local HTTP delivery for subscription notifications
+- replicated entity mutation log for near-realtime cross-node notification fan-out
 
 The codebase is being aligned to the ETSI NGSI-LD API surface:
 
@@ -20,10 +21,10 @@ This repository no longer uses in-memory-only storage. It now uses DefraDB-backe
 - `src/api.rs`: Actix route wiring
 - `src/app`: shared application state
 - `src/context`: tenant, `Via`, and `Link` header handling
-- `src/domain`: persisted document and result types
+- `src/domain`: persisted document, mutation-log, and result types
 - `src/persistence`: repository traits plus DefraDB and in-memory implementations
-- `src/query`: entity and temporal query DTOs plus Mongo query planning
-- `src/services`: entity, temporal, subscription, notification, discovery, and federation logic
+- `src/query`: entity and temporal query DTOs plus backend-neutral query planning
+- `src/services`: entity, temporal, subscription, notification, and discovery logic
 - `src/utils`: JSON and time helpers
 
 ## How It Works
@@ -33,17 +34,49 @@ At runtime the broker handles each request in four layers:
 1. `src/api.rs` maps HTTP routes under `/ngsi-ld/v1` to service functions and normalizes request metadata.
 2. `src/context/headers.rs` extracts `NGSILD-Tenant`, `Link`, and `Via`. `Link` can backfill `@context`; `Via` remains available for internal broker-to-broker metadata.
 3. `src/services/*` performs validation, applies NGSI-LD semantics, persists state locally, and triggers side effects.
-4. `src/persistence/defradb.rs` stores wrappers such as `{ tenant, id, doc }` in DefraDB GraphQL collections.
+4. `src/persistence/defradb.rs` stores wrappers such as `{ tenant, id, doc }` plus replicated mutation records in DefraDB GraphQL collections.
 
 Write flow:
 
 - persist entity/temporal/subscription locally in DefraDB
-- deliver matching subscription notifications inline when applicable
+- append `EntityMutationRecord` for entity writes
+- deliver matching local subscription notifications inline when applicable
+- remote brokers consume replicated `EntityMutationRecord` rows and deliver their own local subscriptions
+- large `entityOperations/create` requests also fan out committed entity snapshots to configured peer brokers to keep bulk data convergence bounded while DefraDB P2P catches up
 
 Read flow:
 
 - query local DefraDB-backed records first using filters built in `src/query/planner.rs`
 - apply output projection (`normalized`, `keyValues`, `GeoJSON`, temporal formats) before returning the response
+
+## Cross-Node Notification Logic
+
+The broker does not use DefraDB internal PubSub as an application API. DefraDB P2P still replicates data, but the broker consumes an explicit replicated mutation log that is stable and shaped for NGSI-LD notifications.
+
+```mermaid
+flowchart TD
+    A[Client writes entity to broker A] --> B[Broker A persists EntityRecord]
+    B --> C[Broker A appends EntityMutationRecord]
+    C --> D[Broker A sends local subscription notifications]
+    C --> E[DefraDB P2P replicates EntityMutationRecord]
+    E --> F[Broker B mutation-log watcher polls recent events]
+    F --> G{originBrokerId == broker B?}
+    G -- yes --> H[Skip self-origin event]
+    G -- no --> I[Dedupe eventId]
+    I --> J[Build EntityEvent from mutation record]
+    J --> K[Suppress duplicate snapshot fallback event]
+    K --> L[Broker B sends local subscription notifications]
+    M[Slow snapshot watcher] --> N[Reconcile missed events and direct storage writes]
+    N --> L
+```
+
+Runtime behavior:
+
+- `EntityMutationRecord` is replicated between DefraDB nodes together with `EntityRecord`.
+- Fast watcher polls mutation records every `BROKER_ENTITY_EVENT_WATCH_INTERVAL_MS` milliseconds, default `100`.
+- Snapshot watcher remains enabled as a slower correctness fallback, default `30000` milliseconds.
+- Subscription records stay local; only each broker's local subscriptions are evaluated.
+- Delete events carry the removed entity payload in the mutation log, so remote brokers can notify without waiting for snapshot absence.
 
 ## Implemented Routes
 
@@ -122,6 +155,8 @@ Implemented delivery pieces:
 
 - local subscription matching in Rust
 - direct outbound HTTP notification delivery
+- near-realtime replicated mutation-log watcher for cross-node entity notifications
+- slower snapshot reconcile watcher for missed events and direct storage writes
 - per-subscription delivery accounting via `timesSent`, `timesFailed`, `lastNotification`, `lastSuccess`, `lastFailure`
 
 ## Configuration
@@ -133,9 +168,15 @@ Environment variables:
 - `BROKER_ID`: broker identifier, default `cognets-broker`
 - `BROKER_PUBLIC_ENDPOINT`: public broker base URL, default `http://127.0.0.1:8080/ngsi-ld/v1`
 - `BROKER_DEFRADB_URL`: DefraDB GraphQL endpoint, default `http://127.0.0.1:9181/api/v0/graphql`
+- `BROKER_DEFRADB_TIMEOUT_MS`: DefraDB storage HTTP timeout in milliseconds, default `30000`
 - `BROKER_OUTBOUND_TIMEOUT_MS`: outbound HTTP timeout in milliseconds, default `5000`
-- `BROKER_ENTITY_WATCH_ENABLED`: enables replicated-entity polling watcher for cross-node notifications, default `true`
-- `BROKER_ENTITY_WATCH_INTERVAL_MS`: watcher poll interval in milliseconds, default `1000`
+- `BROKER_P2P_ENABLED`: enables broker-to-broker helper sync, default `true`
+- `BROKER_P2P_SEEDS`: comma-separated peer broker base URLs ending in `/ngsi-ld/v1`, default empty
+- `BROKER_PEER_SYNC_TIMEOUT_MS`: internal peer sync HTTP timeout in milliseconds, default `120000`
+- `BROKER_ENTITY_EVENT_WATCH_ENABLED`: enables fast replicated mutation-log watcher, default `true`
+- `BROKER_ENTITY_EVENT_WATCH_INTERVAL_MS`: mutation-log watcher poll interval in milliseconds, default `100`
+- `BROKER_ENTITY_WATCH_ENABLED`: enables slower snapshot reconcile watcher for missed events and direct storage writes, default `true`
+- `BROKER_ENTITY_WATCH_INTERVAL_MS`: snapshot reconcile interval in milliseconds, default `30000`
 
 ## Run
 
@@ -191,7 +232,7 @@ Swarm test details:
 
 - uses `docker-compose.yml` to start 10 DefraDB nodes, 10 broker nodes, and one HTTP notification sink
 - keeps subscriptions local to each broker and proves they are not visible from other brokers
-- DefraDB P2P is enabled only for `EntityRecord`; `SubscriptionRecord` is never added to pubsub or replicators
+- DefraDB P2P is enabled for `EntityRecord` and `EntityMutationRecord`; `SubscriptionRecord` is never added to pubsub or replicators
 - verifies create from `broker1`, update from `broker5`, and delete from `broker9`
 - asserts every broker observes replicated entity state and emits one local notification for each lifecycle step
 - measures per-node data propagation time and compares it with notification receipt time for create, update, and delete
@@ -216,3 +257,4 @@ Important current limits:
 - JSON-LD context cache APIs are not implemented
 - notification retry scheduling, backoff, and dead-letter handling are not implemented
 - DefraDB collection bootstrap is not implemented by broker; expected collections must already exist
+- mutation-log cleanup/compaction is not implemented; long-running deployments should add retention by age or cursor

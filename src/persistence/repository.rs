@@ -10,7 +10,9 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::{
-    domain::types::{StoredDocument, SubscriptionDocument, TemporalEntityDocument},
+    domain::types::{
+        EntityMutationDocument, StoredDocument, SubscriptionDocument, TemporalEntityDocument,
+    },
     error::BrokerError,
     query::planner::{GeoFilter, QueryPlan, TemporalFilter},
 };
@@ -24,6 +26,8 @@ pub struct Repositories {
     pub temporals: Arc<dyn TemporalRepository>,
     /// Subscription storage.
     pub subscriptions: Arc<dyn SubscriptionRepository>,
+    /// Replicated entity mutation-log storage.
+    pub entity_mutations: Arc<dyn EntityMutationRepository>,
 }
 
 impl Repositories {
@@ -32,11 +36,13 @@ impl Repositories {
         entities: Arc<dyn EntityRepository>,
         temporals: Arc<dyn TemporalRepository>,
         subscriptions: Arc<dyn SubscriptionRepository>,
+        entity_mutations: Arc<dyn EntityMutationRepository>,
     ) -> Self {
         Self {
             entities,
             temporals,
             subscriptions,
+            entity_mutations,
         }
     }
 }
@@ -52,6 +58,13 @@ pub trait EntityRepository: Send + Sync {
     ) -> Result<Option<StoredDocument>, BrokerError>;
     /// Inserts new entity document.
     async fn insert(&self, document: StoredDocument) -> Result<(), BrokerError>;
+    /// Inserts multiple new entity documents.
+    async fn insert_many(&self, documents: Vec<StoredDocument>) -> Result<(), BrokerError> {
+        for document in documents {
+            self.insert(document).await?;
+        }
+        Ok(())
+    }
     /// Replaces existing entity document or upserts it.
     async fn replace(&self, document: StoredDocument) -> Result<(), BrokerError>;
     /// Deletes entity document and returns removed value.
@@ -121,6 +134,9 @@ pub trait SubscriptionRepository: Send + Sync {
     /// Lists tenants currently present in subscription storage.
     async fn list_tenants(&self) -> Result<Vec<String>, BrokerError>;
     /// Updates delivery accounting fields after notification attempt.
+    ///
+    /// Implementations may coalesce or defer these writes because delivery
+    /// accounting is observability metadata, not entity replication state.
     async fn mark_delivery(
         &self,
         tenant: &str,
@@ -128,6 +144,50 @@ pub trait SubscriptionRepository: Send + Sync {
         success: bool,
         now: &str,
     ) -> Result<(), BrokerError>;
+
+    /// Coalesces delivery accounting for many notification attempts.
+    async fn mark_delivery_batch(
+        &self,
+        tenant: &str,
+        subscription_id: &str,
+        successes: u64,
+        failures: u64,
+        now: &str,
+    ) -> Result<(), BrokerError> {
+        for _ in 0..successes {
+            self.mark_delivery(tenant, subscription_id, true, now)
+                .await?;
+        }
+        for _ in 0..failures {
+            self.mark_delivery(tenant, subscription_id, false, now)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+/// Replicated mutation-log operations used by fast cross-node notification worker.
+pub trait EntityMutationRepository: Send + Sync {
+    /// Appends one entity mutation event.
+    async fn insert(&self, document: EntityMutationDocument) -> Result<(), BrokerError>;
+
+    /// Appends multiple entity mutation events.
+    async fn insert_many(&self, documents: Vec<EntityMutationDocument>) -> Result<(), BrokerError> {
+        for document in documents {
+            self.insert(document).await?;
+        }
+        Ok(())
+    }
+
+    /// Lists events at or after given origin timestamp.
+    ///
+    /// Implementations may over-return and filter in process; callers dedupe by
+    /// `event_id`, so exact storage-side cursor semantics are not required.
+    async fn list_after(
+        &self,
+        created_after_millis: i64,
+    ) -> Result<Vec<EntityMutationDocument>, BrokerError>;
 }
 
 /// Updates one top-level status field in JSON payload.
@@ -135,6 +195,49 @@ pub fn update_status_field(document: &mut Value, field: &str, value: Value) {
     if let Some(object) = document.as_object_mut() {
         object.insert(field.to_string(), value);
     }
+}
+
+/// Applies coalesced notification delivery counters to subscription payload.
+pub fn update_delivery_fields(document: &mut Value, successes: u64, failures: u64, now: &str) {
+    let attempts = successes + failures;
+    if attempts == 0 {
+        return;
+    }
+
+    if let Some(notification) = document
+        .get_mut("notification")
+        .and_then(Value::as_object_mut)
+    {
+        let sent = notification
+            .get("timesSent")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            + attempts;
+        notification.insert("timesSent".to_string(), Value::from(sent));
+        notification.insert(
+            "status".to_string(),
+            Value::String(if failures == 0 { "ok" } else { "failed" }.to_string()),
+        );
+        notification.insert(
+            "lastNotification".to_string(),
+            Value::String(now.to_string()),
+        );
+
+        if successes > 0 {
+            notification.insert("lastSuccess".to_string(), Value::String(now.to_string()));
+        }
+        if failures > 0 {
+            let failed = notification
+                .get("timesFailed")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                + failures;
+            notification.insert("timesFailed".to_string(), Value::from(failed));
+            notification.insert("lastFailure".to_string(), Value::String(now.to_string()));
+        }
+    }
+
+    update_status_field(document, "modifiedAt", Value::String(now.to_string()));
 }
 
 /// Applies basic query-plan filters to entity wrapper documents.

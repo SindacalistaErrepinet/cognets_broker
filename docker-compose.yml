@@ -23,9 +23,15 @@ x-broker-service: &broker-service
     RUST_LOG: info
     BROKER_HOST: 0.0.0.0
     BROKER_PORT: 8080
+    BROKER_DEFRADB_TIMEOUT_MS: 30000
     BROKER_OUTBOUND_TIMEOUT_MS: 5000
+    BROKER_P2P_ENABLED: "true"
+    BROKER_PEER_SYNC_TIMEOUT_MS: 120000
+    BROKER_P2P_SEEDS: http://broker1:8080/ngsi-ld/v1,http://broker2:8080/ngsi-ld/v1,http://broker3:8080/ngsi-ld/v1,http://broker4:8080/ngsi-ld/v1,http://broker5:8080/ngsi-ld/v1,http://broker6:8080/ngsi-ld/v1,http://broker7:8080/ngsi-ld/v1,http://broker8:8080/ngsi-ld/v1,http://broker9:8080/ngsi-ld/v1,http://broker10:8080/ngsi-ld/v1
+    BROKER_ENTITY_EVENT_WATCH_ENABLED: "true"
+    BROKER_ENTITY_EVENT_WATCH_INTERVAL_MS: 100
     BROKER_ENTITY_WATCH_ENABLED: "true"
-    BROKER_ENTITY_WATCH_INTERVAL_MS: 250
+    BROKER_ENTITY_WATCH_INTERVAL_MS: 30000
   volumes:
     - ./target/debug/cognets_broker:/usr/local/bin/cognets_broker:ro
   networks:

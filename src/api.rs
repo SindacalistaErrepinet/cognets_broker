@@ -255,7 +255,17 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/attributes", web::get().to(list_attributes))
             .route("/attributes/{attrId}", web::get().to(get_attribute))
             .route("/info/sourceIdentity", web::get().to(get_source_identity)),
-    );
+    )
+    .service(web::scope("/internal").route("/entities/batch", web::post().to(sync_entities_batch)));
+}
+
+/// Handles internal broker-to-broker entity snapshot batches.
+async fn sync_entities_batch(
+    state: web::Data<AppState>,
+    body: web::Json<Vec<StoredDocument>>,
+) -> Result<HttpResponse, BrokerError> {
+    entities::apply_peer_entity_batch(state.get_ref(), body.into_inner()).await?;
+    Ok(HttpResponse::NoContent().finish())
 }
 
 #[utoipa::path(
@@ -347,7 +357,10 @@ async fn post_query_entities(
     count: web::Query<SubscriptionQuery>,
 ) -> Result<HttpResponse, BrokerError> {
     let context = RequestContext::from_request(&request);
-    let query = body.into_inner();
+    let mut query = body.into_inner();
+    if count.count.unwrap_or(false) {
+        query.count = Some(true);
+    }
     let representation =
         representation_from_request(&request, query.format.as_deref(), query.options.as_deref());
     let result = entities::query(state.get_ref(), &request, &context, &query).await?;
@@ -2111,6 +2124,44 @@ mod tests {
             items[0].get("id").and_then(Value::as_str),
             Some("urn:ngsi-ld:Vehicle:linked-1")
         );
+    }
+
+    #[actix_web::test]
+    async fn entity_query_count_ignores_response_limit() {
+        let state = test_state();
+        for index in 1..=2 {
+            state
+                .repositories
+                .entities
+                .insert(crate::domain::types::StoredDocument {
+                    tenant: "default".to_string(),
+                    ngsi_id: format!("urn:ngsi-ld:Vehicle:count-{index}"),
+                    doc: json!({
+                        "id": format!("urn:ngsi-ld:Vehicle:count-{index}"),
+                        "type": "Vehicle",
+                        "speed": {"type": "Property", "value": index}
+                    }),
+                })
+                .await
+                .unwrap();
+        }
+
+        let app = test::init_service(App::new().app_data(state).configure(configure)).await;
+        let request = test::TestRequest::get()
+            .uri("/ngsi-ld/v1/entities?type=Vehicle&count=true&limit=1")
+            .to_request();
+        let response = test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(HEADER_RESULTS_COUNT)
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
+        let body = response_body(response).await;
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
     }
 
     #[actix_web::test]

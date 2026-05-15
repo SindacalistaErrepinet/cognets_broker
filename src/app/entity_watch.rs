@@ -1,8 +1,8 @@
-//! Polling watcher for externally observed entity changes.
+//! Watchers for externally observed entity changes.
 //!
-//! Local write paths already enqueue notifications directly. This watcher exists
-//! for changes that arrive through shared storage from other broker instances or
-//! external writers.
+//! Local write paths already enqueue notifications directly. Fast mutation-log
+//! watcher handles replicated broker-originated changes. Snapshot watcher stays
+//! as slower reconciliation fallback for missed events and direct storage writes.
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -14,12 +14,15 @@ use serde_json::Value;
 
 use crate::{
     app::state::AppState,
-    domain::types::{EntityEvent, EntityEventKind},
+    domain::types::{EntityEvent, EntityEventKind, EntityMutationOperation},
     error::BrokerError,
     query::planner::QueryPlan,
     services::notifications,
     utils::json::{entity_attribute_names, reserved_member},
+    utils::time::now_timestamp_millis,
 };
+
+const MUTATION_LOG_CURSOR_OVERLAP_MS: i64 = 60_000;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 /// Internal key for one tenant-scoped entity snapshot.
@@ -67,18 +70,106 @@ impl EntityWatchState {
     }
 }
 
-/// Starts polling worker that turns externally observed entity changes into notifications.
+/// Starts configured entity change watchers.
 pub fn spawn(state: AppState) {
-    if !state.config.entity_watch_enabled {
-        return;
+    if state.config.entity_event_watch_enabled {
+        let interval = Duration::from_millis(state.config.entity_event_watch_interval_ms.max(25));
+        let event_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) = entity_event_watch_loop(event_state, interval).await {
+                warn!("entity mutation-log watcher stopped: {error}");
+            }
+        });
     }
 
-    let interval = Duration::from_millis(state.config.entity_watch_interval_ms.max(100));
-    tokio::spawn(async move {
-        if let Err(error) = entity_watch_loop(state, interval).await {
-            warn!("entity watch worker stopped: {error}");
+    if state.config.entity_watch_enabled {
+        let interval = Duration::from_millis(state.config.entity_watch_interval_ms.max(100));
+        tokio::spawn(async move {
+            if let Err(error) = entity_watch_loop(state, interval).await {
+                warn!("entity snapshot watcher stopped: {error}");
+            }
+        });
+    }
+}
+
+/// Polls replicated mutation log and emits remote broker events quickly.
+async fn entity_event_watch_loop(state: AppState, interval: Duration) -> Result<(), BrokerError> {
+    info!("entity mutation-log watcher started");
+    let mut cursor = 0_i64;
+    let mut seen = HashSet::new();
+
+    loop {
+        // DefraDB P2P can replicate same-time peer writes out of timestamp
+        // order. Keep a bounded overlap so a local self-origin event cannot
+        // advance cursor past older remote events that arrive slightly later.
+        let after = cursor.saturating_sub(MUTATION_LOG_CURSOR_OVERLAP_MS);
+        match state.repositories.entity_mutations.list_after(after).await {
+            Ok(events) => {
+                let mut notification_events: HashMap<String, Vec<(Value, EntityEvent)>> =
+                    HashMap::new();
+                for event in events {
+                    cursor = cursor.max(event.created_at_millis);
+                    if event.origin_broker_id == state.config.broker_id {
+                        seen.insert(event.event_id);
+                        continue;
+                    }
+                    if !seen.insert(event.event_id.clone()) {
+                        continue;
+                    }
+
+                    let entity_key = key(&event.tenant, &event.entity_id);
+                    let current_document = match event.operation {
+                        EntityMutationOperation::Deleted => None,
+                        EntityMutationOperation::Created | EntityMutationOperation::Updated => {
+                            Some(&event.payload)
+                        }
+                    };
+                    if state
+                        .entity_watch
+                        .suppress_if_local(&entity_key, current_document)
+                    {
+                        continue;
+                    }
+
+                    let entity_event = EntityEvent {
+                        kind: match event.operation {
+                            EntityMutationOperation::Created => EntityEventKind::Created,
+                            EntityMutationOperation::Updated => EntityEventKind::Updated,
+                            EntityMutationOperation::Deleted => EntityEventKind::Deleted,
+                        },
+                        changed_attributes: event.changed_attributes,
+                    };
+                    match entity_event.kind {
+                        EntityEventKind::Deleted => state
+                            .entity_watch
+                            .record_local_delete(&event.tenant, &event.entity_id),
+                        EntityEventKind::Created | EntityEventKind::Updated => state
+                            .entity_watch
+                            .record_local_upsert(&event.tenant, &event.entity_id, &event.payload),
+                    }
+                    notification_events
+                        .entry(event.tenant)
+                        .or_default()
+                        .push((event.payload, entity_event));
+                }
+
+                for (tenant, events) in notification_events {
+                    if let Err(error) =
+                        notifications::enqueue_notifications_batch(&state, &tenant, &events).await
+                    {
+                        warn!(
+                            "entity mutation-log notification batch failed in tenant {}: {}",
+                            tenant, error
+                        );
+                    }
+                }
+                cursor = cursor.max(now_timestamp_millis());
+            }
+            Err(error) => warn!("entity mutation-log poll failed: {error}"),
         }
-    });
+
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Polls storage for current entity snapshots and emits inferred events.
@@ -132,6 +223,7 @@ async fn entity_watch_loop(state: AppState, interval: Duration) -> Result<(), Br
             }
         }
 
+        let mut notification_events: HashMap<String, Vec<(Value, EntityEvent)>> = HashMap::new();
         for (entity_key, document, event) in events {
             let current_document = current.get(&entity_key);
             if state
@@ -141,13 +233,19 @@ async fn entity_watch_loop(state: AppState, interval: Duration) -> Result<(), Br
                 continue;
             }
 
+            notification_events
+                .entry(entity_key.tenant)
+                .or_default()
+                .push((document, event));
+        }
+
+        for (tenant, events) in notification_events {
             if let Err(error) =
-                notifications::enqueue_notifications(&state, &entity_key.tenant, &document, &event)
-                    .await
+                notifications::enqueue_notifications_batch(&state, &tenant, &events).await
             {
                 warn!(
-                    "entity watch notification failed for {} in tenant {}: {}",
-                    entity_key.entity_id, entity_key.tenant, error
+                    "entity watch notification batch failed in tenant {}: {}",
+                    tenant, error
                 );
             }
         }

@@ -13,11 +13,15 @@ use serde_json::{Value, json};
 
 use crate::{
     config::AppConfig,
-    domain::types::{StoredDocument, SubscriptionDocument, TemporalEntityDocument},
+    domain::types::{
+        EntityMutationDocument, EntityMutationOperation, StoredDocument, SubscriptionDocument,
+        TemporalEntityDocument,
+    },
     error::BrokerError,
     persistence::repository::{
-        EntityRepository, Repositories, SubscriptionRepository, TemporalRepository,
-        filter_entity_documents, filter_temporal_documents, update_status_field,
+        EntityMutationRepository, EntityRepository, Repositories, SubscriptionRepository,
+        TemporalRepository, filter_entity_documents, filter_temporal_documents,
+        update_delivery_fields,
     },
     query::planner::{GeoFilter, QueryPlan, TemporalFilter},
 };
@@ -25,6 +29,10 @@ use crate::{
 const ENTITY_COLLECTION: &str = "EntityRecord";
 const TEMPORAL_COLLECTION: &str = "TemporalRecord";
 const SUBSCRIPTION_COLLECTION: &str = "SubscriptionRecord";
+const ENTITY_MUTATION_COLLECTION: &str = "EntityMutationRecord";
+const BULK_INSERT_CHUNK_SIZE: usize = 100;
+const TRANSIENT_RETRY_ATTEMPTS: usize = 8;
+const TRANSIENT_RETRY_BASE_DELAY_MS: u64 = 100;
 
 /// Builds DefraDB-backed repositories over the GraphQL API.
 pub struct DefraDbRepositories;
@@ -34,12 +42,13 @@ impl DefraDbRepositories {
     pub fn new(config: &AppConfig) -> Result<Repositories, BrokerError> {
         let client = Arc::new(DefraDbClient::new(
             &config.defradb_url,
-            config.outbound_timeout_ms,
+            config.defradb_timeout_ms,
         )?);
         Ok(Repositories::new(
             Arc::new(DefraDbEntityRepository::new(client.clone())),
             Arc::new(DefraDbTemporalRepository::new(client.clone())),
-            Arc::new(DefraDbSubscriptionRepository::new(client)),
+            Arc::new(DefraDbSubscriptionRepository::new(client.clone())),
+            Arc::new(DefraDbEntityMutationRepository::new(client)),
         ))
     }
 }
@@ -67,6 +76,26 @@ impl DefraDbClient {
 
     /// Executes GraphQL request and extracts typed `data` payload.
     async fn execute<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: Value,
+    ) -> Result<T, BrokerError> {
+        for attempt in 1..=TRANSIENT_RETRY_ATTEMPTS {
+            match self.execute_once(query, variables.clone()).await {
+                Ok(data) => return Ok(data),
+                Err(error) if attempt < TRANSIENT_RETRY_ATTEMPTS && is_transient_error(&error) => {
+                    let delay_ms = TRANSIENT_RETRY_BASE_DELAY_MS * 2_u64.pow((attempt - 1) as u32);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        unreachable!("DefraDB retry loop always returns before exhaustion")
+    }
+
+    /// Executes one GraphQL request without retry logic.
+    async fn execute_once<T: DeserializeOwned>(
         &self,
         query: &str,
         variables: Value,
@@ -115,6 +144,15 @@ impl DefraDbClient {
     }
 }
 
+/// Returns true for DefraDB optimistic transaction conflicts that are safe to retry.
+fn is_transient_error(error: &BrokerError) -> bool {
+    matches!(
+        error,
+        BrokerError::Internal(message)
+            if message.contains("transaction conflict") && message.contains("Please retry")
+    )
+}
+
 #[derive(Debug, Deserialize)]
 /// Generic GraphQL response envelope.
 struct GraphQlResponse<T> {
@@ -150,6 +188,26 @@ struct TemporalRecordRow {
     payload: String,
     #[serde(rename = "historyJson")]
     history_json: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+/// Row used for replicated entity mutation-log records.
+struct EntityMutationRecordRow {
+    #[serde(rename = "_docID")]
+    doc_id: String,
+    tenant: String,
+    #[serde(rename = "eventId")]
+    event_id: String,
+    #[serde(rename = "entityId")]
+    entity_id: String,
+    operation: String,
+    payload: String,
+    #[serde(rename = "changedAttributesJson")]
+    changed_attributes_json: String,
+    #[serde(rename = "originBrokerId")]
+    origin_broker_id: String,
+    #[serde(rename = "createdAtMillis")]
+    created_at_millis: f64,
 }
 
 #[derive(Clone)]
@@ -194,6 +252,41 @@ impl EntityRepository for DefraDbEntityRepository {
             &encode_json(&document.doc, "entity payload")?,
         )
         .await
+    }
+
+    async fn insert_many(&self, documents: Vec<StoredDocument>) -> Result<(), BrokerError> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+
+        let tenant = documents[0].tenant.clone();
+        if documents.iter().any(|document| document.tenant != tenant) {
+            return Err(BrokerError::internal(
+                "bulk entity insert requires one tenant".to_string(),
+            ));
+        }
+
+        let mut existing = std::collections::HashSet::new();
+        for document in &documents {
+            if !existing.insert(document.ngsi_id.clone()) {
+                return Err(BrokerError::Conflict(format!(
+                    "entity {} already exists",
+                    document.ngsi_id
+                )));
+            }
+        }
+
+        let inputs = documents
+            .iter()
+            .map(|document| {
+                Ok(json!({
+                    "tenant": document.tenant,
+                    "ngsiId": document.ngsi_id,
+                    "payload": encode_json(&document.doc, "entity payload")?,
+                }))
+            })
+            .collect::<Result<Vec<_>, BrokerError>>()?;
+        create_opaque_records(&self.client, ENTITY_COLLECTION, inputs).await
     }
 
     async fn replace(&self, document: StoredDocument) -> Result<(), BrokerError> {
@@ -462,47 +555,129 @@ impl SubscriptionRepository for DefraDbSubscriptionRepository {
         success: bool,
         now: &str,
     ) -> Result<(), BrokerError> {
+        self.mark_delivery_batch(
+            tenant,
+            subscription_id,
+            u64::from(success),
+            u64::from(!success),
+            now,
+        )
+        .await
+    }
+
+    async fn mark_delivery_batch(
+        &self,
+        tenant: &str,
+        subscription_id: &str,
+        successes: u64,
+        failures: u64,
+        now: &str,
+    ) -> Result<(), BrokerError> {
         let Some(mut document) = self.get(tenant, subscription_id).await? else {
             return Ok(());
         };
 
-        if let Some(notification) = document
-            .doc
-            .get_mut("notification")
-            .and_then(Value::as_object_mut)
-        {
-            let sent = notification
-                .get("timesSent")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                + 1;
-            notification.insert("timesSent".to_string(), Value::from(sent));
-            notification.insert(
-                "status".to_string(),
-                Value::String(if success { "ok" } else { "failed" }.to_string()),
-            );
-            notification.insert(
-                "lastNotification".to_string(),
-                Value::String(now.to_string()),
-            );
-            if success {
-                notification.insert("lastSuccess".to_string(), Value::String(now.to_string()));
-            } else {
-                let failed = notification
-                    .get("timesFailed")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    + 1;
-                notification.insert("timesFailed".to_string(), Value::from(failed));
-                notification.insert("lastFailure".to_string(), Value::String(now.to_string()));
-            }
-        }
-        update_status_field(
-            &mut document.doc,
-            "modifiedAt",
-            Value::String(now.to_string()),
-        );
+        update_delivery_fields(&mut document.doc, successes, failures, now);
         self.replace(document).await
+    }
+}
+
+#[derive(Clone)]
+/// DefraDB-backed replicated entity mutation-log repository.
+pub struct DefraDbEntityMutationRepository {
+    client: Arc<DefraDbClient>,
+}
+
+impl DefraDbEntityMutationRepository {
+    fn new(client: Arc<DefraDbClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl EntityMutationRepository for DefraDbEntityMutationRepository {
+    async fn insert(&self, document: EntityMutationDocument) -> Result<(), BrokerError> {
+        let _: Value = self
+            .client
+            .execute(
+                &format!(
+                    "mutation($tenant: String!, $eventId: String!, $entityId: String!, $operation: String!, $payload: String!, $changedAttributesJson: String!, $originBrokerId: String!, $createdAtMillis: Float64!) {{ add_{ENTITY_MUTATION_COLLECTION}(input: [{{tenant: $tenant, eventId: $eventId, entityId: $entityId, operation: $operation, payload: $payload, changedAttributesJson: $changedAttributesJson, originBrokerId: $originBrokerId, createdAtMillis: $createdAtMillis}}]) {{ _docID }} }}"
+                ),
+                json!({
+                    "tenant": document.tenant,
+                    "eventId": document.event_id,
+                    "entityId": document.entity_id,
+                    "operation": document.operation.as_str(),
+                    "payload": encode_json(&document.payload, "entity mutation payload")?,
+                    "changedAttributesJson": encode_json(
+                        &document.changed_attributes,
+                        "entity mutation changed attributes",
+                    )?,
+                    "originBrokerId": document.origin_broker_id,
+                    "createdAtMillis": document.created_at_millis as f64,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_many(&self, documents: Vec<EntityMutationDocument>) -> Result<(), BrokerError> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+
+        let inputs = documents
+            .iter()
+            .map(|document| {
+                Ok(json!({
+                    "tenant": document.tenant,
+                    "eventId": document.event_id,
+                    "entityId": document.entity_id,
+                    "operation": document.operation.as_str(),
+                    "payload": encode_json(&document.payload, "entity mutation payload")?,
+                    "changedAttributesJson": encode_json(
+                        &document.changed_attributes,
+                        "entity mutation changed attributes",
+                    )?,
+                    "originBrokerId": document.origin_broker_id,
+                    "createdAtMillis": document.created_at_millis as f64,
+                }))
+            })
+            .collect::<Result<Vec<_>, BrokerError>>()?;
+        let query = format!(
+            "mutation($input: [EntityMutationRecordMutationInputArg!]!) {{ add_{ENTITY_MUTATION_COLLECTION}(input: $input) {{ _docID }} }}"
+        );
+        for chunk in inputs.chunks(BULK_INSERT_CHUNK_SIZE) {
+            let _: Value = self.client.execute(&query, json!({"input": chunk})).await?;
+        }
+        Ok(())
+    }
+
+    async fn list_after(
+        &self,
+        created_after_millis: i64,
+    ) -> Result<Vec<EntityMutationDocument>, BrokerError> {
+        let data: EntityMutationRecordListData = self
+            .client
+            .execute(
+                &format!(
+                    "query($createdAtMillis: Float64!) {{ {ENTITY_MUTATION_COLLECTION}(filter: {{createdAtMillis: {{_geq: $createdAtMillis}}}}) {{ _docID tenant eventId entityId operation payload changedAttributesJson originBrokerId createdAtMillis }} }}"
+                ),
+                json!({"createdAtMillis": created_after_millis as f64}),
+            )
+            .await?;
+        let mut documents = data
+            .records
+            .into_iter()
+            .filter(|row| (row.created_at_millis as i64) >= created_after_millis)
+            .map(decode_entity_mutation_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        documents.sort_by(|left, right| {
+            left.created_at_millis
+                .cmp(&right.created_at_millis)
+                .then_with(|| left.event_id.cmp(&right.event_id))
+        });
+        Ok(documents)
     }
 }
 
@@ -569,6 +744,21 @@ async fn create_opaque_record(
             json!({"tenant": tenant, "ngsiId": ngsi_id, "payload": payload}),
         )
         .await?;
+    Ok(())
+}
+
+/// Creates opaque record rows in one storage request.
+async fn create_opaque_records(
+    client: &DefraDbClient,
+    collection: &str,
+    inputs: Vec<Value>,
+) -> Result<(), BrokerError> {
+    let query = format!(
+        "mutation($input: [{collection}MutationInputArg!]!) {{ add_{collection}(input: $input) {{ _docID }} }}"
+    );
+    for chunk in inputs.chunks(BULK_INSERT_CHUNK_SIZE) {
+        let _: Value = client.execute(&query, json!({"input": chunk})).await?;
+    }
     Ok(())
 }
 
@@ -724,6 +914,12 @@ struct TemporalRecordListData {
     records: Vec<TemporalRecordRow>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EntityMutationRecordListData {
+    #[serde(rename = "EntityMutationRecord")]
+    records: Vec<EntityMutationRecordRow>,
+}
+
 /// Decodes entity wrapper from opaque storage row.
 fn decode_entity_row(row: OpaqueRecordRow) -> Result<StoredDocument, BrokerError> {
     Ok(StoredDocument {
@@ -749,6 +945,32 @@ fn decode_temporal_row(row: TemporalRecordRow) -> Result<TemporalEntityDocument,
         ngsi_id: row.ngsi_id,
         doc: decode_json(&row.payload, "temporal payload")?,
         history: decode_json(&row.history_json, "temporal history")?,
+    })
+}
+
+/// Decodes replicated entity mutation from storage row.
+fn decode_entity_mutation_row(
+    row: EntityMutationRecordRow,
+) -> Result<EntityMutationDocument, BrokerError> {
+    let operation = EntityMutationOperation::from_str(&row.operation).ok_or_else(|| {
+        BrokerError::internal(format!(
+            "unknown entity mutation operation {} in {}",
+            row.operation, row.doc_id
+        ))
+    })?;
+    let created_at_millis = row.created_at_millis as i64;
+    Ok(EntityMutationDocument {
+        tenant: row.tenant,
+        event_id: row.event_id,
+        entity_id: row.entity_id,
+        operation,
+        payload: decode_json(&row.payload, "entity mutation payload")?,
+        changed_attributes: decode_json(
+            &row.changed_attributes_json,
+            "entity mutation changed attributes",
+        )?,
+        origin_broker_id: row.origin_broker_id,
+        created_at_millis,
     })
 }
 

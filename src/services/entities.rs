@@ -17,17 +17,26 @@
 //! Several signatures still carry `_local_only` and `_query_string` for API
 //! symmetry. Current implementation of this module does not branch on those
 //! values.
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use actix_web::ResponseError;
+use log::{info, warn};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::{
     app::state::AppState,
     context::headers::RequestContext,
     domain::{
         batch::{BatchEntityError, BatchOperationResult, NotUpdatedDetails, UpdateResult},
-        types::{EntityEvent, EntityEventKind, StoredDocument},
+        types::{
+            EntityEvent, EntityEventKind, EntityMutationDocument, EntityMutationOperation,
+            StoredDocument,
+        },
     },
     error::{BrokerError, ProblemDetails},
     query::{
@@ -46,9 +55,17 @@ use crate::{
     },
     utils::{
         json::{apply_merge_patch, editable_fragment_members},
-        time::now_timestamp,
+        time::{now_timestamp, now_timestamp_millis},
     },
 };
+
+/// Maximum batch size that still gets one replicated mutation-log row per entity.
+///
+/// Large `entityOperations/create` requests already replicate entity snapshots.
+/// Duplicating each row into `EntityMutationRecord` doubles DefraDB P2P traffic
+/// and can starve snapshot convergence in 10-node bulk loads. Remote brokers rely
+/// on the slower snapshot watcher for those bulk notification side effects.
+const MUTATION_LOG_BATCH_EVENT_LIMIT: usize = 100;
 
 /// Queries local entities for current tenant and projects them into response shape.
 ///
@@ -646,12 +663,12 @@ pub async fn replace_attr(
     Ok(())
 }
 
-/// Creates multiple entities sequentially for same tenant.
+/// Creates multiple entities for same tenant.
 ///
-/// There is no transaction or rollback across items: each entity is validated,
-/// conflict-checked, and inserted inline. Successful inserts are remembered and
-/// notified after loop so side effects only run for documents that were actually
-/// persisted.
+/// Payloads are validated first, existing ids are checked with one repository
+/// query, then successful rows are inserted and logged in bulk. This keeps large
+/// `entityOperations/create` requests from spending one storage round trip per
+/// entity while preserving per-entity validation and conflict reporting.
 ///
 /// Outer `Err(BrokerError)` means infrastructure failure. Inner
 /// `Err(BatchOperationResult)` means request completed with logical per-entity
@@ -660,41 +677,25 @@ pub async fn batch_create(
     state: &AppState,
     context: &RequestContext,
     entities: Vec<Value>,
-    _local_only: bool,
+    local_only: bool,
     _query_string: Option<String>,
 ) -> Result<Result<Vec<String>, BatchOperationResult>, BrokerError> {
     let mut created = Vec::new();
     let mut result = BatchOperationResult::default();
-    let mut docs = Vec::new();
+    let mut prepared = Vec::new();
+    let mut seen = HashSet::new();
 
     for mut entity in entities {
         match prepare_entity_for_create(&mut entity, context) {
             Ok(entity_id) => {
-                if state
-                    .repositories
-                    .entities
-                    .get(&context.tenant, &entity_id)
-                    .await?
-                    .is_some()
-                {
+                if !seen.insert(entity_id.clone()) {
                     result.errors.push(batch_error(
                         &entity_id,
                         409,
                         format!("entity {entity_id} already exists"),
                     ));
                 } else {
-                    created.push(entity_id.clone());
-                    result.success.push(entity_id.clone());
-                    docs.push((entity_id.clone(), entity.clone()));
-                    state
-                        .repositories
-                        .entities
-                        .insert(StoredDocument {
-                            tenant: context.tenant.clone(),
-                            ngsi_id: entity_id,
-                            doc: entity,
-                        })
-                        .await?;
+                    prepared.push((entity_id, entity));
                 }
             }
             Err(error) => result.errors.push(batch_error(
@@ -705,27 +706,258 @@ pub async fn batch_create(
         }
     }
 
+    let existing_ids = if prepared.is_empty() {
+        HashSet::new()
+    } else {
+        let mut plan = QueryPlan::default();
+        plan.ids = prepared
+            .iter()
+            .map(|(entity_id, _)| entity_id.clone())
+            .collect();
+        state
+            .repositories
+            .entities
+            .query(&context.tenant, &plan)
+            .await?
+            .into_iter()
+            .map(|document| document.ngsi_id)
+            .collect()
+    };
+
+    let mut docs = Vec::new();
+    let mut stored_documents = Vec::new();
+    for (entity_id, entity) in prepared {
+        if existing_ids.contains(&entity_id) {
+            result.errors.push(batch_error(
+                &entity_id,
+                409,
+                format!("entity {entity_id} already exists"),
+            ));
+            continue;
+        }
+        created.push(entity_id.clone());
+        result.success.push(entity_id.clone());
+        docs.push((entity_id.clone(), entity.clone()));
+        stored_documents.push(StoredDocument {
+            tenant: context.tenant.clone(),
+            ngsi_id: entity_id,
+            doc: entity,
+        });
+    }
+
+    if !stored_documents.is_empty() {
+        let _entity_write_guard = state.entity_write_lock.lock().await;
+        state
+            .repositories
+            .entities
+            .insert_many(stored_documents)
+            .await?;
+    }
+
+    if !local_only && docs.len() > MUTATION_LOG_BATCH_EVENT_LIMIT {
+        spawn_peer_entity_batch_sync(state, &context.tenant, &docs);
+    }
+
     // Deliver side effects only for writes that committed successfully during
     // first pass; rejected entities never reach this loop.
-    for (entity_id, entity) in &docs {
-        enqueue_local_notifications(
-            state,
-            &context.tenant,
-            entity_id,
-            entity,
-            EntityEvent {
-                kind: EntityEventKind::Created,
-                changed_attributes: changed_attribute_names(entity),
-            },
-        )
-        .await?;
-    }
+    enqueue_local_notifications_batch(
+        state,
+        &context.tenant,
+        &docs
+            .iter()
+            .map(|(entity_id, entity)| {
+                (
+                    entity_id.clone(),
+                    entity.clone(),
+                    EntityEvent {
+                        kind: EntityEventKind::Created,
+                        changed_attributes: changed_attribute_names(entity),
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await?;
 
     if result.errors.is_empty() {
         Ok(Ok(created))
     } else {
         Ok(Err(result))
     }
+}
+
+/// Applies an internal broker-to-broker entity snapshot batch.
+///
+/// This is deliberately narrower than public `entityOperations/create`: peers
+/// send already-normalized committed records, so receiver stores them as-is and
+/// records watcher suppression state. Large-batch sync is data-convergence help;
+/// it avoids remote subscription fan-out storms while DefraDB P2P catches up.
+pub async fn apply_peer_entity_batch(
+    state: &AppState,
+    documents: Vec<StoredDocument>,
+) -> Result<(), BrokerError> {
+    let mut by_tenant: HashMap<String, Vec<StoredDocument>> = HashMap::new();
+    for document in documents {
+        by_tenant
+            .entry(document.tenant.clone())
+            .or_default()
+            .push(document);
+    }
+
+    let _entity_write_guard = state.entity_write_lock.lock().await;
+    for (tenant, documents) in by_tenant {
+        let mut deduped_by_id = HashMap::new();
+        for document in documents {
+            deduped_by_id.insert(document.ngsi_id.clone(), document);
+        }
+
+        let mut incoming = Vec::new();
+        for document in deduped_by_id.into_values() {
+            state
+                .entity_watch
+                .record_local_upsert(&tenant, &document.ngsi_id, &document.doc);
+            incoming.push(document);
+        }
+
+        let mut plan = QueryPlan::default();
+        plan.ids = incoming
+            .iter()
+            .map(|document| document.ngsi_id.clone())
+            .collect();
+        let existing_ids = state
+            .repositories
+            .entities
+            .query(&tenant, &plan)
+            .await?
+            .into_iter()
+            .map(|document| document.ngsi_id)
+            .collect::<HashSet<_>>();
+        let new_documents = incoming
+            .into_iter()
+            .filter(|document| !existing_ids.contains(&document.ngsi_id))
+            .collect::<Vec<_>>();
+        insert_peer_documents(state, new_documents).await?;
+    }
+
+    Ok(())
+}
+
+/// Inserts peer-received snapshots while tolerating rows DefraDB P2P won first.
+async fn insert_peer_documents(
+    state: &AppState,
+    documents: Vec<StoredDocument>,
+) -> Result<(), BrokerError> {
+    if documents.is_empty() {
+        return Ok(());
+    }
+
+    match state
+        .repositories
+        .entities
+        .insert_many(documents.clone())
+        .await
+    {
+        Ok(()) => return Ok(()),
+        Err(error) if is_peer_duplicate_error(&error) => {}
+        Err(error) => return Err(error),
+    }
+
+    for document in documents {
+        match state.repositories.entities.insert(document).await {
+            Ok(()) => {}
+            Err(error) if is_peer_duplicate_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+/// Detects duplicate rows that may arrive from DefraDB P2P before helper sync.
+fn is_peer_duplicate_error(error: &BrokerError) -> bool {
+    matches!(error, BrokerError::Conflict(_))
+        || matches!(
+            error,
+            BrokerError::Internal(message)
+                if message.contains("a document with the given ID already exists")
+        )
+}
+
+/// Starts best-effort broker-to-broker data fan-out for large create batches.
+fn spawn_peer_entity_batch_sync(state: &AppState, tenant: &str, docs: &[(String, Value)]) {
+    if !state.config.p2p_enabled || state.config.p2p_seeds.is_empty() {
+        return;
+    }
+
+    let Some(urls) = peer_sync_urls(state) else {
+        return;
+    };
+    let documents = docs
+        .iter()
+        .map(|(entity_id, entity)| StoredDocument {
+            tenant: tenant.to_string(),
+            ngsi_id: entity_id.clone(),
+            doc: entity.clone(),
+        })
+        .collect::<Vec<_>>();
+    let timeout = Duration::from_millis(state.config.peer_sync_timeout_ms);
+
+    for url in urls {
+        let documents = documents.clone();
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder().timeout(timeout).build() {
+                Ok(client) => client,
+                Err(error) => {
+                    warn!("failed creating peer sync HTTP client: {error}");
+                    return;
+                }
+            };
+            match client.post(&url).json(&documents).send().await {
+                Ok(response) if !response.status().is_success() => {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    warn!(
+                        "peer entity batch sync to {} returned HTTP {}: {}",
+                        url,
+                        status.as_u16(),
+                        body
+                    );
+                }
+                Err(error) => warn!("peer entity batch sync to {url} failed: {error}"),
+                Ok(_) => {}
+            }
+        });
+    }
+}
+
+/// Builds internal sync URLs from configured public peer NGSI-LD endpoints.
+fn peer_sync_urls(state: &AppState) -> Option<Vec<String>> {
+    let self_endpoint = normalize_url(&state.config.public_endpoint);
+    let mut seen = HashSet::new();
+    let urls = state
+        .config
+        .p2p_seeds
+        .iter()
+        .filter_map(|seed| {
+            let normalized = normalize_url(seed);
+            if normalized.is_empty()
+                || normalized == self_endpoint
+                || !seen.insert(normalized.clone())
+            {
+                return None;
+            }
+            let root = normalized
+                .strip_suffix("/ngsi-ld/v1")
+                .unwrap_or(&normalized);
+            Some(format!("{root}/internal/entities/batch"))
+        })
+        .collect::<Vec<_>>();
+
+    (!urls.is_empty()).then_some(urls)
+}
+
+fn normalize_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
 }
 
 /// Upserts multiple entities sequentially.
@@ -735,8 +967,8 @@ pub async fn batch_create(
 /// (`update_mode = false`). Returned outcome tells API layer whether any new
 /// ids were created so it can choose between `201 Created` and `204 No Content`.
 ///
-/// Current implementation persists inline and reports per-item success/failure;
-/// it does not perform a second notification pass.
+/// Successful writes append replicated mutation events and deliver matching
+/// local notifications after persistence.
 pub async fn batch_upsert(
     state: &AppState,
     context: &RequestContext,
@@ -779,12 +1011,22 @@ pub async fn batch_upsert(
                         .entities
                         .replace(existing.clone())
                         .await?;
-                    docs.push(existing.doc.clone());
+                    docs.push((
+                        entity_id.clone(),
+                        existing.doc.clone(),
+                        EntityEventKind::Updated,
+                        changed_attribute_names(&entity),
+                    ));
                     result.success.push(entity_id);
                 } else {
                     created_ids.push(entity_id.clone());
                     result.success.push(entity_id.clone());
-                    docs.push(entity.clone());
+                    docs.push((
+                        entity_id.clone(),
+                        entity.clone(),
+                        EntityEventKind::Created,
+                        changed_attribute_names(&entity),
+                    ));
                     state
                         .repositories
                         .entities
@@ -804,6 +1046,20 @@ pub async fn batch_upsert(
         }
     }
 
+    for (entity_id, entity, kind, changed_attributes) in &docs {
+        enqueue_local_notifications(
+            state,
+            &context.tenant,
+            entity_id,
+            entity,
+            EntityEvent {
+                kind: *kind,
+                changed_attributes: changed_attributes.clone(),
+            },
+        )
+        .await?;
+    }
+
     if result.errors.is_empty() {
         Ok(Ok(crate::domain::batch::BatchUpsertOutcome {
             created_ids,
@@ -820,8 +1076,8 @@ pub async fn batch_upsert(
 /// When `no_overwrite` is enabled, existing keys are left untouched silently
 /// instead of producing attribute-level error payloads.
 ///
-/// Current implementation persists successful updates inline and only returns
-/// batch status summary.
+/// Successful updates append replicated mutation events and deliver matching
+/// local notifications after persistence.
 pub async fn batch_update(
     state: &AppState,
     context: &RequestContext,
@@ -851,6 +1107,7 @@ pub async fn batch_update(
         {
             Some(mut existing) => {
                 let attrs = editable_fragment_members(&entity);
+                let mut changed_attributes = Vec::new();
                 if let Some(object) = existing.doc.as_object_mut() {
                     for (key, value) in attrs {
                         // Batch `noOverwrite` behavior is silent skip rather
@@ -858,7 +1115,8 @@ pub async fn batch_update(
                         if no_overwrite && object.contains_key(&key) {
                             continue;
                         }
-                        object.insert(key, value);
+                        object.insert(key.clone(), value);
+                        changed_attributes.push(key);
                     }
                     object.insert("modifiedAt".to_string(), Value::String(now_timestamp()));
                 }
@@ -867,7 +1125,13 @@ pub async fn batch_update(
                     .entities
                     .replace(existing.clone())
                     .await?;
-                docs.push(existing.doc.clone());
+                if !changed_attributes.is_empty() {
+                    docs.push((
+                        entity_id.to_string(),
+                        existing.doc.clone(),
+                        changed_attributes,
+                    ));
+                }
                 result.success.push(entity_id.to_string());
             }
             None => result.errors.push(batch_error(
@@ -876,6 +1140,20 @@ pub async fn batch_update(
                 format!("entity {entity_id} was not found"),
             )),
         }
+    }
+
+    for (entity_id, entity, changed_attributes) in &docs {
+        enqueue_local_notifications(
+            state,
+            &context.tenant,
+            entity_id,
+            entity,
+            EntityEvent {
+                kind: EntityEventKind::Updated,
+                changed_attributes: changed_attributes.clone(),
+            },
+        )
+        .await?;
     }
 
     if result.errors.is_empty() {
@@ -943,9 +1221,9 @@ pub async fn batch_merge(
 /// Deletes multiple entity ids and reports per-item failures.
 ///
 /// Each id is attempted independently and successful deletions are not rolled
-/// back if later ids fail. This helper deletes directly by id from repository,
-/// so it does not fetch original payload first and therefore cannot apply
-/// optional type guards or emit delete notifications from this path.
+/// back if later ids fail. Successful deletes append replicated mutation events
+/// carrying removed payload so remote brokers can evaluate subscriptions without
+/// waiting for snapshot reconciliation.
 pub async fn batch_delete(
     state: &AppState,
     context: &RequestContext,
@@ -954,22 +1232,38 @@ pub async fn batch_delete(
     _query_string: Option<String>,
 ) -> Result<Result<(), BatchOperationResult>, BrokerError> {
     let mut result = BatchOperationResult::default();
+    let mut docs = Vec::new();
     for entity_id in entity_ids.clone() {
-        // This path is intentionally direct repository delete, with no pre-load
-        // of full entity document.
         match state
             .repositories
             .entities
             .delete(&context.tenant, &entity_id)
             .await?
         {
-            Some(_) => result.success.push(entity_id),
+            Some(document) => {
+                docs.push((entity_id.clone(), document.doc));
+                result.success.push(entity_id)
+            }
             None => result.errors.push(batch_error(
                 &entity_id,
                 404,
                 format!("entity {entity_id} was not found"),
             )),
         }
+    }
+
+    for (entity_id, entity) in &docs {
+        enqueue_local_notifications(
+            state,
+            &context.tenant,
+            entity_id,
+            entity,
+            EntityEvent {
+                kind: EntityEventKind::Deleted,
+                changed_attributes: changed_attribute_names(entity),
+            },
+        )
+        .await?;
     }
 
     if result.errors.is_empty() {
@@ -1016,7 +1310,106 @@ async fn enqueue_local_notifications(
             .record_local_upsert(tenant, entity_id, entity),
     }
 
+    if let Err(error) = append_entity_mutation(state, tenant, entity_id, entity, &event).await {
+        warn!(
+            "failed appending entity mutation for {} in tenant {}: {}",
+            entity_id, tenant, error
+        );
+    }
     notifications::enqueue_notifications(state, tenant, entity, &event).await
+}
+
+async fn enqueue_local_notifications_batch(
+    state: &AppState,
+    tenant: &str,
+    events: &[(String, Value, EntityEvent)],
+) -> Result<(), BrokerError> {
+    let now = now_timestamp_millis();
+    let append_mutation_log = events.len() <= MUTATION_LOG_BATCH_EVENT_LIMIT;
+    let mut mutations = Vec::with_capacity(if append_mutation_log { events.len() } else { 0 });
+    for (entity_id, entity, event) in events {
+        match event.kind {
+            EntityEventKind::Deleted => state.entity_watch.record_local_delete(tenant, entity_id),
+            EntityEventKind::Created | EntityEventKind::Updated => state
+                .entity_watch
+                .record_local_upsert(tenant, entity_id, entity),
+        }
+
+        if append_mutation_log {
+            mutations.push(entity_mutation_document(
+                state, tenant, entity_id, entity, event, now,
+            ));
+        }
+    }
+
+    if append_mutation_log {
+        if let Err(error) = state
+            .repositories
+            .entity_mutations
+            .insert_many(mutations)
+            .await
+        {
+            warn!("failed appending entity mutation batch in tenant {tenant}: {error}");
+        }
+    } else {
+        info!(
+            "skipping mutation-log append for {} entity batch in tenant {}; snapshot watcher will reconcile remote notifications",
+            events.len(),
+            tenant
+        );
+    }
+
+    let notification_events = events
+        .iter()
+        .map(|(_, entity, event)| (entity.clone(), event.clone()))
+        .collect::<Vec<_>>();
+    notifications::enqueue_notifications_batch(state, tenant, &notification_events).await
+}
+
+/// Appends replicated mutation-log record for fast remote broker notifications.
+async fn append_entity_mutation(
+    state: &AppState,
+    tenant: &str,
+    entity_id: &str,
+    entity: &Value,
+    event: &EntityEvent,
+) -> Result<(), BrokerError> {
+    state
+        .repositories
+        .entity_mutations
+        .insert(entity_mutation_document(
+            state,
+            tenant,
+            entity_id,
+            entity,
+            event,
+            now_timestamp_millis(),
+        ))
+        .await
+}
+
+fn entity_mutation_document(
+    state: &AppState,
+    tenant: &str,
+    entity_id: &str,
+    entity: &Value,
+    event: &EntityEvent,
+    created_at_millis: i64,
+) -> EntityMutationDocument {
+    EntityMutationDocument {
+        tenant: tenant.to_string(),
+        event_id: format!("urn:ngsi-ld:EntityMutation:{}", Uuid::new_v4()),
+        entity_id: entity_id.to_string(),
+        operation: match event.kind {
+            EntityEventKind::Created => EntityMutationOperation::Created,
+            EntityEventKind::Updated => EntityMutationOperation::Updated,
+            EntityEventKind::Deleted => EntityMutationOperation::Deleted,
+        },
+        payload: entity.clone(),
+        changed_attributes: event.changed_attributes.clone(),
+        origin_broker_id: state.config.broker_id.clone(),
+        created_at_millis,
+    }
 }
 
 /// Builds linked-entity graph when query traversal requires it.

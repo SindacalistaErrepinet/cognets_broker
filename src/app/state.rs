@@ -1,7 +1,11 @@
 //! Shared application state passed to HTTP handlers and services.
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use reqwest::Client;
+use tokio::sync::Mutex;
 
 use crate::{
     app::entity_watch::EntityWatchState, config::AppConfig, error::BrokerError,
@@ -21,6 +25,8 @@ pub struct AppState {
     pub started_at: Instant,
     /// Duplicate-suppression state for entity watch worker.
     pub entity_watch: EntityWatchState,
+    /// Serializes bulk entity writes hitting same local DefraDB node.
+    pub entity_write_lock: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -39,6 +45,7 @@ impl AppState {
             http_client,
             started_at: Instant::now(),
             entity_watch: EntityWatchState::default(),
+            entity_write_lock: Arc::new(Mutex::new(())),
         })
     }
 }

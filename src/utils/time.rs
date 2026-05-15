@@ -15,6 +15,11 @@ pub fn now_timestamp_nanos() -> i64 {
         .unwrap_or_else(|| Utc::now().timestamp_micros() * 1000)
 }
 
+/// Returns current UTC timestamp as milliseconds since epoch.
+pub fn now_timestamp_millis() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
 /// Parses RFC3339 timestamp into nanoseconds since epoch.
 pub fn timestamp_to_nanos(value: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(value).ok().map(|timestamp| {
